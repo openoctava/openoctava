@@ -1,0 +1,18 @@
+[package]
+name = "octava-audio"
+description = "Real-time audio engine for Octava"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+octava-core.workspace = true
+cpal.workspace = true
+fluidlite.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true

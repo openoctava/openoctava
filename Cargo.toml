@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Octava contributors"]
+repository = "https://github.com/octava-daw/octava"
+
+[workspace.dependencies]
+octava-core = { path = "crates/core" }
+octava-audio = { path = "crates/audio" }
+octava-render = { path = "crates/render" }
+octava-ui = { path = "crates/ui" }
+
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+egui = "0.35"
+eframe = "0.35"
+egui_dock = "0.20"
+
+cpal = "0.18"
+fluidlite = { version = "0.2", features = ["builtin"] }
+rtrb = "0.4"
+hound = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"

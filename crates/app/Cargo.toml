@@ -1,0 +1,22 @@
+[package]
+name = "octava-app"
+description = "Desktop application shell for Octava"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "octava"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+octava-core.workspace = true
+octava-audio.workspace = true
+octava-ui.workspace = true
+egui.workspace = true
+eframe.workspace = true

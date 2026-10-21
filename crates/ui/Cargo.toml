@@ -1,0 +1,16 @@
+[package]
+name = "octava-ui"
+description = "egui user interface for Octava"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+octava-core.workspace = true
+egui.workspace = true
+egui_dock.workspace = true
