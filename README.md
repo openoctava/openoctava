@@ -7,10 +7,12 @@ OpenOctava (binary: `octava`) is a lightweight, native digital audio workstation
 The project is under active development. The current foundation includes:
 
 - A tempo-aware project model with tracks, MIDI clips, notes, undo/redo, and playback snapshots.
-- A native `egui` interface with a timeline, piano roll, inspector, transport, and custom titlebar.
+- A native `egui` interface with a timeline, clip-scoped piano roll, clips browser, mixer, inspector, transport, and custom titlebar.
 - A real-time audio engine built on `cpal` and FluidLite with SoundFont 2 playback.
 - Offline WAV rendering that reuses the same scheduler and synthesizer as live playback.
-- Piano-roll note creation, movement, resizing, and deletion; timeline clip movement and track reordering with configurable snapping.
+- Piano-roll note creation, movement, resizing, and deletion; timeline clip movement, right-edge resizing, and track reordering with configurable snapping.
+- Per-track mixer strips with mute, solo, gain, and pan controls.
+- Clip and track context menus, plus note audition from the piano roll and its key gutter.
 - WAV export from the Export menu, reusing the live audio scheduler.
 
 ## Architecture

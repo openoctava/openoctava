@@ -3,7 +3,9 @@
 //! The UI never touches audio APIs. It reads [`octava_core::Project`], renders
 //! widgets and emits [`UiAction`] values for the application layer to execute.
 
+mod clips;
 mod inspector;
+mod mixer;
 mod piano_roll;
 mod state;
 mod theme;
@@ -21,16 +23,20 @@ pub use state::{PlaybackView, UiAction};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
+    Clips,
     Timeline,
     PianoRoll,
+    Mixer,
     Inspector,
 }
 
 impl Tab {
     fn title(self) -> &'static str {
         match self {
+            Self::Clips => "Clips",
             Self::Timeline => "Timeline",
             Self::PianoRoll => "Piano Roll",
+            Self::Mixer => "Mixer",
             Self::Inspector => "Inspector",
         }
     }
@@ -54,10 +60,15 @@ impl OctavaUi {
     #[must_use]
     pub fn new() -> Self {
         let mut dock = DockState::new(vec![Tab::Timeline]);
-        dock.main_surface_mut()
-            .split_right(NodeIndex::root(), 0.76, vec![Tab::Inspector]);
-        dock.main_surface_mut()
-            .split_below(NodeIndex::root(), 0.34, vec![Tab::PianoRoll]);
+        let [timeline, _clips] =
+            dock.main_surface_mut()
+                .split_left(NodeIndex::root(), 0.18, vec![Tab::Clips]);
+        let [timeline, _inspector] =
+            dock.main_surface_mut()
+                .split_right(timeline, 0.76, vec![Tab::Inspector]);
+        let _ =
+            dock.main_surface_mut()
+                .split_below(timeline, 0.66, vec![Tab::PianoRoll, Tab::Mixer]);
 
         Self {
             dock,
@@ -116,6 +127,13 @@ impl OctavaUi {
                     .show_secondary_button_hint(false)
                     .show_inside(ui, &mut viewer);
             });
+
+        if self.state.focus_piano_roll
+            && let Some(path) = self.dock.find_tab(&Tab::PianoRoll)
+        {
+            self.state.focus_piano_roll = false;
+            let _ = self.dock.set_active_tab(path);
+        }
 
         if *show_about {
             about_window(ui.ctx(), show_about);
@@ -242,12 +260,20 @@ impl OctavaUi {
                     });
 
                     ui.menu_button("Windows", |ui| {
+                        if ui.button("Clips").clicked() {
+                            focus_tab = Some(Tab::Clips);
+                            ui.close();
+                        }
                         if ui.button("Timeline").clicked() {
                             focus_tab = Some(Tab::Timeline);
                             ui.close();
                         }
                         if ui.button("Piano Roll").clicked() {
                             focus_tab = Some(Tab::PianoRoll);
+                            ui.close();
+                        }
+                        if ui.button("Mixer").clicked() {
+                            focus_tab = Some(Tab::Mixer);
                             ui.close();
                         }
                         if ui.button("Inspector").clicked() {
@@ -412,11 +438,17 @@ impl TabViewer for WorkspaceViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
+            Tab::Clips => {
+                clips::show(ui, self.project, self.playback, self.state, self.actions);
+            }
             Tab::Timeline => {
                 timeline::show(ui, self.project, self.playback, self.state, self.actions)
             }
             Tab::PianoRoll => {
                 piano_roll::show(ui, self.project, self.playback, self.state, self.actions)
+            }
+            Tab::Mixer => {
+                mixer::show(ui, self.project, self.playback, self.state, self.actions);
             }
             Tab::Inspector => {
                 inspector::show(ui, self.project, self.state, self.actions);

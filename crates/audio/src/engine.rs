@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fluidlite::{FontId, Settings, Synth};
-use octava_core::{PlaybackSnapshot, Ticks};
+use octava_core::{PlaybackSnapshot, Preset, Ticks};
 use rtrb::{Consumer, Producer, RingBuffer};
 use thiserror::Error;
 
@@ -117,6 +117,16 @@ impl AudioTelemetry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreviewNote {
+    pub channel: u8,
+    pub preset: Preset,
+    pub gain: f32,
+    pub pan: f32,
+    pub key: u8,
+    pub velocity: u8,
+}
+
 pub(crate) enum AudioCommand {
     Play {
         snapshot: Arc<PlaybackSnapshot>,
@@ -127,6 +137,7 @@ pub(crate) enum AudioCommand {
     Stop,
     Seek(Ticks),
     SetSnapshot(Arc<PlaybackSnapshot>),
+    PreviewNote(PreviewNote),
 }
 
 pub struct AudioEngine {
@@ -242,6 +253,10 @@ impl AudioEngine {
 
     pub fn set_snapshot(&mut self, snapshot: Arc<PlaybackSnapshot>) -> Result<(), AudioError> {
         self.send(AudioCommand::SetSnapshot(snapshot))
+    }
+
+    pub fn preview_note(&mut self, note: PreviewNote) -> Result<(), AudioError> {
+        self.send(AudioCommand::PreviewNote(note))
     }
 
     fn send(&mut self, command: AudioCommand) -> Result<(), AudioError> {

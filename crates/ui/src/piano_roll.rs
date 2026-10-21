@@ -44,6 +44,16 @@ pub(crate) fn show(
         );
         return;
     };
+    let Some(clip) = state.selected_clip.and_then(|clip| track.clip(clip)) else {
+        ui.painter_at(rect).text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Select a clip in the Timeline or Clips panel",
+            FontId::proportional(14.0),
+            theme::TEXT_DIM,
+        );
+        return;
+    };
 
     let grid_top = rect.top() + RULER_HEIGHT;
     let grid_left = rect.left() + GUTTER_WIDTH;
@@ -58,21 +68,28 @@ pub(crate) fn show(
     };
     let track_index = project.track_index(track.id).unwrap_or(0);
 
-    handle_input(ui, project, track, state, &response, &grid, actions);
+    handle_input(ui, project, track, clip, state, &response, &grid, actions);
 
     draw_key_rows(ui, &grid, rect);
-    draw_clips(ui, &grid, track, track_index, state.selected_clip);
+    draw_clip(ui, &grid, clip, track_index);
     draw_grid_lines(ui, project, &grid, rect, state.snap);
-    draw_notes(ui, &grid, track, track_index, state);
+    draw_notes(ui, &grid, track, clip, track_index, state);
     draw_ruler(ui, project, &grid, rect);
     draw_playhead(ui, &grid, playback);
 
-    if track.clips.is_empty() {
+    if clip.notes.is_empty() {
+        let clip_left = grid
+            .tick_to_x(clip.start.0 as f64)
+            .clamp(grid.rect.left(), grid.rect.right());
+        let clip_right = grid
+            .tick_to_x(clip.end().0 as f64)
+            .clamp(grid.rect.left(), grid.rect.right());
+        let center = pos2((clip_left + clip_right) / 2.0, grid.rect.center().y);
         ui.painter_at(grid.rect).text(
-            grid.rect.center(),
+            center,
             Align2::CENTER_CENTER,
-            "Add a clip in the timeline to start composing",
-            FontId::proportional(13.0),
+            "Click inside the clip to add a note",
+            FontId::proportional(12.0),
             theme::TEXT_FAINT,
         );
     }
@@ -80,7 +97,7 @@ pub(crate) fn show(
     ui.painter_at(rect).text(
         pos2(rect.right() - 8.0, rect.bottom() - 6.0),
         Align2::RIGHT_BOTTOM,
-        "click: add note  ·  drag: move  ·  drag edge: resize  ·  Del: delete  ·  Ctrl+wheel: zoom",
+        "click: add note  ·  drag: move/audition  ·  drag edge: resize  ·  Del: delete  ·  Ctrl+wheel: zoom",
         FontId::proportional(9.5),
         theme::TEXT_FAINT,
     );
@@ -171,6 +188,7 @@ fn handle_input(
     ui: &egui::Ui,
     project: &Project,
     track: &Track,
+    clip: &MidiClip,
     state: &mut UiState,
     response: &Response,
     grid: &Grid,
@@ -228,10 +246,23 @@ fn handle_input(
         state.note_drag = None;
     }
 
+    if ui.input(|input| input.pointer.primary_pressed())
+        && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+        && pointer.x < grid.rect.left()
+        && pointer.y >= grid.rect.top()
+        && pointer.y <= grid.rect.bottom()
+    {
+        actions.push(UiAction::AuditionNote {
+            track: track.id,
+            key: key_at_y(grid, pointer.y),
+            velocity: 100,
+        });
+    }
+
     if response.drag_started()
         && let Some(origin) = ui.input(|input| input.pointer.press_origin())
         && grid.rect.contains(origin)
-        && let Some(hit) = hit_test_note(track, grid, origin)
+        && let Some(hit) = hit_test_note(track, clip, grid, origin)
     {
         let edge_zone = (hit.rect.width() * 0.25).clamp(4.0, 10.0);
         let kind = if hit.rect.width() > 12.0 && origin.x >= hit.rect.right() - edge_zone {
@@ -257,7 +288,7 @@ fn handle_input(
     if state.note_drag.is_some()
         && let Some(pointer) = ui.input(|input| input.pointer.latest_pos())
     {
-        update_note_drag(project, grid, state, pointer);
+        update_note_drag(project, grid, state, pointer, actions);
     }
 
     if response.hovered()
@@ -269,7 +300,7 @@ fn handle_input(
                 NoteDragKind::Move => CursorIcon::Grabbing,
             });
         } else if grid.rect.contains(pointer)
-            && let Some(hit) = hit_test_note(track, grid, pointer)
+            && let Some(hit) = hit_test_note(track, clip, grid, pointer)
         {
             let edge_zone = (hit.rect.width() * 0.25).clamp(4.0, 10.0);
             let cursor = if hit.rect.width() > 12.0 && pointer.x >= hit.rect.right() - edge_zone {
@@ -296,7 +327,7 @@ fn handle_input(
             return;
         }
 
-        if let Some(hit) = hit_test_note(track, grid, pointer) {
+        if let Some(hit) = hit_test_note(track, clip, grid, pointer) {
             state.select_clip(hit.note.track, hit.note.clip);
             state.selected_note = Some(hit.note);
             return;
@@ -309,10 +340,7 @@ fn handle_input(
         let tick = state
             .snap
             .snap_tick(grid.x_to_tick(pointer.x), project.tempo_map.ppq());
-        if let Some(clip) = clip_at_tick(track, tick)
-            && tick >= clip.start.0
-            && tick < clip.end().0
-        {
+        if tick >= clip.start.0 && tick < clip.end().0 {
             let start = tick - clip.start.0;
             let available = clip.length.0.saturating_sub(start);
             let length = state
@@ -322,7 +350,6 @@ fn handle_input(
                 .min(available);
             if length > 0 {
                 let key = key_at_y(grid, pointer.y);
-                state.select_clip(track.id, clip.id);
                 state.selected_note = None;
                 actions.push(UiAction::Edit(EditCommand::AddNote {
                     track: track.id,
@@ -346,7 +373,13 @@ fn handle_input(
     }
 }
 
-fn update_note_drag(project: &Project, grid: &Grid, state: &mut UiState, pointer: egui::Pos2) {
+fn update_note_drag(
+    project: &Project,
+    grid: &Grid,
+    state: &mut UiState,
+    pointer: egui::Pos2,
+    actions: &mut Vec<UiAction>,
+) {
     let Some(drag) = state.note_drag else {
         return;
     };
@@ -399,6 +432,14 @@ fn update_note_drag(project: &Project, grid: &Grid, state: &mut UiState, pointer
         }
     }
 
+    if next.preview_key != drag.preview_key {
+        actions.push(UiAction::AuditionNote {
+            track: drag.note.track,
+            key: next.preview_key,
+            velocity: 100,
+        });
+    }
+
     state.note_drag = Some(next);
 }
 
@@ -446,13 +487,6 @@ fn delete_selected_note(state: &mut UiState, actions: &mut Vec<UiAction>) {
     }));
 }
 
-fn clip_at_tick(track: &Track, tick: u64) -> Option<&MidiClip> {
-    track
-        .clips
-        .iter()
-        .find(|clip| clip.start.0 <= tick && tick < clip.end().0)
-}
-
 fn key_at_y(grid: &Grid, y: f32) -> u8 {
     let key = 127.0 - (y - grid.rect.top() + grid.scroll_y) / grid.key_height;
     key.floor().clamp(0.0, 127.0) as u8
@@ -466,32 +500,35 @@ struct NoteHit {
     rect: Rect,
 }
 
-fn hit_test_note(track: &Track, grid: &Grid, pointer: egui::Pos2) -> Option<NoteHit> {
+fn hit_test_note(
+    track: &Track,
+    clip: &MidiClip,
+    grid: &Grid,
+    pointer: egui::Pos2,
+) -> Option<NoteHit> {
     let mut hit = None;
-    for clip in &track.clips {
-        for note in &clip.notes {
-            let start = clip.start.0.saturating_add(note.start.0);
-            let length = note
-                .length
-                .0
-                .min(clip.length.0.saturating_sub(note.start.0));
-            if length == 0 {
-                continue;
-            }
-            let rect = note_screen_rect(grid, start, length, note.key);
-            if rect.contains(pointer) {
-                hit = Some(NoteHit {
-                    note: NoteRef {
-                        track: track.id,
-                        clip: clip.id,
-                        note: note.id,
-                    },
-                    start: note.start.0,
-                    length: note.length.0,
-                    key: note.key,
-                    rect,
-                });
-            }
+    for note in &clip.notes {
+        let start = clip.start.0.saturating_add(note.start.0);
+        let length = note
+            .length
+            .0
+            .min(clip.length.0.saturating_sub(note.start.0));
+        if length == 0 {
+            continue;
+        }
+        let rect = note_screen_rect(grid, start, length, note.key);
+        if rect.contains(pointer) {
+            hit = Some(NoteHit {
+                note: NoteRef {
+                    track: track.id,
+                    clip: clip.id,
+                    note: note.id,
+                },
+                start: note.start.0,
+                length: note.length.0,
+                key: note.key,
+                rect,
+            });
         }
     }
     hit
@@ -537,6 +574,16 @@ fn draw_key_rows(ui: &egui::Ui, grid: &Grid, panel: Rect) {
     let gutter_painter = ui.painter_at(gutter_rect);
     let grid_painter = ui.painter_at(grid.rect);
     let key_height = grid.key_height;
+    let pointer_key = ui
+        .input(|input| {
+            input
+                .pointer
+                .primary_down()
+                .then(|| input.pointer.hover_pos())
+                .flatten()
+        })
+        .filter(|pointer| gutter_rect.contains(*pointer))
+        .map(|pointer| key_at_y(grid, pointer.y));
 
     for key in 0..=127u8 {
         let y = grid.key_y(key);
@@ -576,7 +623,9 @@ fn draw_key_rows(ui: &egui::Ui, grid: &Grid, panel: Rect) {
         gutter_painter.rect_filled(
             key_rect,
             CornerRadius::ZERO,
-            if black {
+            if pointer_key == Some(key) {
+                theme::ACCENT
+            } else if black {
                 theme::KEY_BLACK
             } else {
                 theme::KEY_WHITE
@@ -614,53 +663,42 @@ fn draw_key_rows(ui: &egui::Ui, grid: &Grid, panel: Rect) {
     );
 }
 
-fn draw_clips(
-    ui: &egui::Ui,
-    grid: &Grid,
-    track: &Track,
-    track_index: usize,
-    selected_clip: Option<octava_core::ClipId>,
-) {
+fn draw_clip(ui: &egui::Ui, grid: &Grid, clip: &MidiClip, track_index: usize) {
     let painter = ui.painter_at(grid.rect);
     let color = theme::track_color(track_index);
 
-    for clip in &track.clips {
-        let x0 = grid.tick_to_x(clip.start.0 as f64);
-        let x1 = grid.tick_to_x(clip.end().0 as f64);
-        if x1 < grid.rect.left() || x0 > grid.rect.right() {
-            continue;
-        }
-
-        let left = x0.max(grid.rect.left());
-        let right = x1.min(grid.rect.right());
-        let clip_rect =
-            Rect::from_min_max(pos2(left, grid.rect.top()), pos2(right, grid.rect.bottom()));
-        painter.rect_filled(clip_rect, CornerRadius::ZERO, color.gamma_multiply(0.07));
-        painter.rect_filled(
-            Rect::from_min_max(
-                pos2(left, grid.rect.top()),
-                pos2(right, grid.rect.top() + CLIP_HEADER_HEIGHT),
-            ),
-            CornerRadius::ZERO,
-            color.gamma_multiply(0.24),
-        );
-        painter.text(
-            pos2(left + 6.0, grid.rect.top() + CLIP_HEADER_HEIGHT * 0.5),
-            Align2::LEFT_CENTER,
-            clip_title(clip),
-            FontId::proportional(9.5),
-            color,
-        );
-
-        if selected_clip == Some(clip.id) {
-            painter.rect_stroke(
-                clip_rect,
-                CornerRadius::ZERO,
-                Stroke::new(1.0, color),
-                StrokeKind::Inside,
-            );
-        }
+    let x0 = grid.tick_to_x(clip.start.0 as f64);
+    let x1 = grid.tick_to_x(clip.end().0 as f64);
+    if x1 < grid.rect.left() || x0 > grid.rect.right() {
+        return;
     }
+
+    let left = x0.max(grid.rect.left());
+    let right = x1.min(grid.rect.right());
+    let clip_rect =
+        Rect::from_min_max(pos2(left, grid.rect.top()), pos2(right, grid.rect.bottom()));
+    painter.rect_filled(clip_rect, CornerRadius::ZERO, color.gamma_multiply(0.07));
+    painter.rect_filled(
+        Rect::from_min_max(
+            pos2(left, grid.rect.top()),
+            pos2(right, grid.rect.top() + CLIP_HEADER_HEIGHT),
+        ),
+        CornerRadius::ZERO,
+        color.gamma_multiply(0.24),
+    );
+    painter.text(
+        pos2(left + 6.0, grid.rect.top() + CLIP_HEADER_HEIGHT * 0.5),
+        Align2::LEFT_CENTER,
+        clip_title(clip),
+        FontId::proportional(9.5),
+        color,
+    );
+    painter.rect_stroke(
+        clip_rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, color),
+        StrokeKind::Inside,
+    );
 }
 
 fn draw_grid_lines(ui: &egui::Ui, project: &Project, grid: &Grid, panel: Rect, snap: SnapSettings) {
@@ -728,91 +766,96 @@ fn draw_grid_lines(ui: &egui::Ui, project: &Project, grid: &Grid, panel: Rect, s
     }
 }
 
-fn draw_notes(ui: &egui::Ui, grid: &Grid, track: &Track, track_index: usize, state: &UiState) {
+fn draw_notes(
+    ui: &egui::Ui,
+    grid: &Grid,
+    track: &Track,
+    clip: &MidiClip,
+    track_index: usize,
+    state: &UiState,
+) {
     let painter = ui.painter_at(grid.rect);
     let color = theme::track_color(track_index);
     let drag = state.note_drag;
 
-    for clip in &track.clips {
-        for note in &clip.notes {
-            let clipped_end = note.start.saturating_add(note.length).min(clip.length);
-            if clipped_end <= note.start {
-                continue;
-            }
+    for note in &clip.notes {
+        let clipped_end = note.start.saturating_add(note.length).min(clip.length);
+        if clipped_end <= note.start {
+            continue;
+        }
 
-            let note_ref = NoteRef {
-                track: track.id,
-                clip: clip.id,
-                note: note.id,
-            };
-            let active_drag = drag.filter(|drag| drag.note == note_ref);
-            let (relative_start, length, key) = active_drag.map_or(
-                (note.start.0, clipped_end.0 - note.start.0, note.key),
-                |drag| {
-                    (
-                        drag.preview_start.0,
-                        drag.preview_length.0,
-                        drag.preview_key,
-                    )
-                },
-            );
-            let start = clip.start.0 as f64 + relative_start as f64;
-            let end = start + length as f64;
-            let x0 = grid.tick_to_x(start);
-            let x1 = grid.tick_to_x(end);
-            let y = grid.key_y(key);
+        let note_ref = NoteRef {
+            track: track.id,
+            clip: clip.id,
+            note: note.id,
+        };
+        let active_drag = drag.filter(|drag| drag.note == note_ref);
+        let (relative_start, length, key) = active_drag.map_or(
+            (note.start.0, clipped_end.0 - note.start.0, note.key),
+            |drag| {
+                (
+                    drag.preview_start.0,
+                    drag.preview_length.0,
+                    drag.preview_key,
+                )
+            },
+        );
+        let start = clip.start.0 as f64 + relative_start as f64;
+        let end = start + length as f64;
+        let x0 = grid.tick_to_x(start);
+        let x1 = grid.tick_to_x(end);
+        let y = grid.key_y(key);
 
-            if x1 < grid.rect.left()
-                || x0 > grid.rect.right()
-                || y + grid.key_height < grid.rect.top()
-                || y > grid.rect.bottom()
-            {
-                continue;
-            }
+        if x1 < grid.rect.left()
+            || x0 > grid.rect.right()
+            || y + grid.key_height < grid.rect.top()
+            || y > grid.rect.bottom()
+        {
+            continue;
+        }
 
-            let left = x0.max(grid.rect.left()) + 1.0;
-            let right = x1.min(grid.rect.right());
-            let width = (right - left).max(2.0);
-            let note_rect = Rect::from_min_size(
-                pos2(left, y + 1.0),
-                vec2(width, (grid.key_height - 2.0).max(2.0)),
-            )
-            .intersect(grid.rect);
-            if note_rect.width() <= 0.0 || note_rect.height() <= 0.0 {
-                continue;
-            }
+        let left = x0.max(grid.rect.left()) + 1.0;
+        let right = x1.min(grid.rect.right());
+        let width = (right - left).max(2.0);
+        let note_rect = Rect::from_min_size(
+            pos2(left, y + 1.0),
+            vec2(width, (grid.key_height - 2.0).max(2.0)),
+        )
+        .intersect(grid.rect);
+        if note_rect.width() <= 0.0 || note_rect.height() <= 0.0 {
+            continue;
+        }
 
-            let velocity = f32::from(note.velocity) / 127.0;
-            let selected = state.selected_note == Some(note_ref);
-            let fill = if selected || active_drag.is_some() {
-                color
-            } else {
-                color.gamma_multiply(0.58 + 0.42 * velocity)
-            };
-            painter.rect_filled(note_rect, CornerRadius::same(3), fill);
+        let velocity = f32::from(note.velocity) / 127.0;
+        let selected = state.selected_note == Some(note_ref);
+        let fill = if selected || active_drag.is_some() {
+            color
+        } else {
+            color.gamma_multiply(0.58 + 0.42 * velocity)
+        };
+        painter.rect_filled(note_rect, CornerRadius::same(3), fill);
+        painter.rect_stroke(
+            note_rect,
+            CornerRadius::same(3),
+            Stroke::new(1.0, fill.gamma_multiply(0.55)),
+            StrokeKind::Inside,
+        );
+
+        if selected || active_drag.is_some() {
             painter.rect_stroke(
                 note_rect,
                 CornerRadius::same(3),
-                Stroke::new(1.0, fill.gamma_multiply(0.55)),
+                Stroke::new(1.0, theme::TEXT),
                 StrokeKind::Inside,
             );
-
-            if selected || active_drag.is_some() {
-                painter.rect_stroke(
-                    note_rect,
-                    CornerRadius::same(3),
-                    Stroke::new(1.0, theme::TEXT),
-                    StrokeKind::Inside,
-                );
-                painter.rect_filled(
-                    Rect::from_min_max(
-                        pos2(note_rect.right() - 2.5, note_rect.top() + 2.0),
-                        pos2(note_rect.right() - 0.5, note_rect.bottom() - 2.0),
-                    ),
-                    CornerRadius::same(1),
-                    theme::TEXT,
-                );
-            }
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(note_rect.right() - 2.5, note_rect.top() + 2.0),
+                    pos2(note_rect.right() - 0.5, note_rect.bottom() - 2.0),
+                ),
+                CornerRadius::same(1),
+                theme::TEXT,
+            );
         }
     }
 }

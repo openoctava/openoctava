@@ -23,6 +23,11 @@ pub enum UiAction {
     Redo,
     NewProject,
     ExportWav,
+    AuditionNote {
+        track: TrackId,
+        key: u8,
+        velocity: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -128,13 +133,36 @@ pub(crate) struct NoteDrag {
     pub preview_key: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipDragKind {
+    Move,
+    ResizeEnd,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClipDrag {
     pub track: TrackId,
     pub clip: ClipId,
+    pub kind: ClipDragKind,
     pub pointer_start_x: f32,
     pub original_start: Ticks,
+    pub original_length: Ticks,
     pub preview_start: Ticks,
+    pub preview_length: Ticks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MixerParam {
+    Gain,
+    Pan,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MixerDrag {
+    pub track: TrackId,
+    pub param: MixerParam,
+    pub original: f32,
+    pub preview: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +201,8 @@ pub(crate) struct UiState {
     pub note_drag: Option<NoteDrag>,
     pub clip_drag: Option<ClipDrag>,
     pub track_drag: Option<TrackDrag>,
+    pub mixer_drag: Option<MixerDrag>,
+    pub focus_piano_roll: bool,
 }
 
 impl UiState {
@@ -238,6 +268,13 @@ impl UiState {
         });
         if !track_drag_is_valid {
             self.track_drag = None;
+        }
+
+        if self
+            .mixer_drag
+            .is_some_and(|drag| project.track(drag.track).is_none())
+        {
+            self.mixer_drag = None;
         }
     }
 

@@ -1,9 +1,10 @@
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, Sense, Stroke, StrokeKind, pos2, vec2,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, RichText, Sense, Stroke, StrokeKind,
+    pos2, vec2,
 };
 use octava_core::{EditCommand, Project, Ticks, Track};
 
-use crate::state::{ClipDrag, PlaybackView, TrackDrag, UiAction, UiState};
+use crate::state::{ClipDrag, ClipDragKind, PlaybackView, TrackDrag, UiAction, UiState};
 use crate::theme;
 
 const HEADER_WIDTH: f32 = 168.0;
@@ -122,6 +123,65 @@ pub(crate) fn show(
                 target_index: index,
             });
         }
+        header_response.context_menu(|ui| {
+            if ui
+                .button("Add Clip at Playhead")
+                .on_hover_text("Create a 4-bar clip")
+                .clicked()
+            {
+                actions.push(UiAction::Edit(EditCommand::AddClip {
+                    track: track.id,
+                    start: playback.playhead,
+                    length: Ticks(bar_ticks.max(1.0) as u64 * 4),
+                }));
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .button(if track.mute {
+                    "Unmute Track"
+                } else {
+                    "Mute Track"
+                })
+                .clicked()
+            {
+                actions.push(UiAction::Edit(EditCommand::SetTrackParams {
+                    track: track.id,
+                    gain: None,
+                    pan: None,
+                    mute: Some(!track.mute),
+                    solo: None,
+                    preset: None,
+                }));
+                ui.close();
+            }
+            if ui
+                .button(if track.solo {
+                    "Unsolo Track"
+                } else {
+                    "Solo Track"
+                })
+                .clicked()
+            {
+                actions.push(UiAction::Edit(EditCommand::SetTrackParams {
+                    track: track.id,
+                    gain: None,
+                    pan: None,
+                    mute: None,
+                    solo: Some(!track.solo),
+                    preset: None,
+                }));
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .button(RichText::new("Delete Track").color(Color32::from_rgb(222, 112, 102)))
+                .clicked()
+            {
+                actions.push(UiAction::Edit(EditCommand::RemoveTrack { track: track.id }));
+                ui.close();
+            }
+        });
         if state.track_drag.is_some_and(|drag| drag.track == track.id) {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         } else if header_response.hovered() {
@@ -196,6 +256,67 @@ pub(crate) fn show(
             theme::TEXT_FAINT,
         );
     }
+
+    let empty_header_rect = Rect::from_min_max(
+        pos2(
+            rect.left(),
+            rect.top() + RULER_HEIGHT + visible_tracks as f32 * LANE_HEIGHT,
+        ),
+        pos2(timeline_left, rect.bottom()),
+    );
+    if empty_header_rect.height() > 2.0 {
+        let empty_response = ui.interact(
+            empty_header_rect,
+            ui.id().with("timeline-empty-header"),
+            Sense::click(),
+        );
+        empty_response.context_menu(|ui| {
+            if ui.button("Add Track").clicked() {
+                actions.push(UiAction::Edit(EditCommand::AddTrack {
+                    name: format!("Track {}", project.tracks.len() + 1),
+                }));
+                ui.close();
+            }
+            if let Some(track) = state.selected_track
+                && ui.button("Add Clip at Playhead").clicked()
+            {
+                actions.push(UiAction::Edit(EditCommand::AddClip {
+                    track,
+                    start: playback.playhead,
+                    length: Ticks(bar_ticks.max(1.0) as u64 * 4),
+                }));
+                ui.close();
+            }
+        });
+    }
+
+    let empty_ruler_rect = Rect::from_min_max(
+        pos2(rect.left(), rect.top()),
+        pos2(timeline_left, rect.top() + RULER_HEIGHT),
+    );
+    ui.interact(
+        empty_ruler_rect,
+        ui.id().with("timeline-empty-ruler"),
+        Sense::click(),
+    )
+    .context_menu(|ui| {
+        if ui.button("Add Track").clicked() {
+            actions.push(UiAction::Edit(EditCommand::AddTrack {
+                name: format!("Track {}", project.tracks.len() + 1),
+            }));
+            ui.close();
+        }
+        if let Some(track) = state.selected_track
+            && ui.button("Add Clip at Playhead").clicked()
+        {
+            actions.push(UiAction::Edit(EditCommand::AddClip {
+                track,
+                start: playback.playhead,
+                length: Ticks(bar_ticks.max(1.0) as u64 * 4),
+            }));
+            ui.close();
+        }
+    });
 
     painter.line_segment(
         [
@@ -297,26 +418,58 @@ fn update_clip_drag(project: &Project, state: &mut UiState, px_per_tick: f64, po
     }
 
     let delta = (pointer_x - drag.pointer_start_x) as f64 / px_per_tick;
-    let start = state.snap.snap_tick(
-        drag.original_start.0 as f64 + delta,
-        project.tempo_map.ppq(),
-    );
-    state.clip_drag = Some(ClipDrag {
-        preview_start: Ticks(start),
-        ..drag
-    });
+    let next = match drag.kind {
+        ClipDragKind::Move => {
+            let start = state.snap.snap_tick(
+                drag.original_start.0 as f64 + delta,
+                project.tempo_map.ppq(),
+            );
+            ClipDrag {
+                preview_start: Ticks(start),
+                preview_length: drag.original_length,
+                ..drag
+            }
+        }
+        ClipDragKind::ResizeEnd => {
+            let original_end = drag.original_start.0 + drag.original_length.0;
+            let min_end = drag.original_start.0.saturating_add(1);
+            let end = state
+                .snap
+                .snap_tick(original_end as f64 + delta, project.tempo_map.ppq())
+                .max(min_end);
+            ClipDrag {
+                preview_start: drag.original_start,
+                preview_length: Ticks(end - drag.original_start.0),
+                ..drag
+            }
+        }
+    };
+    state.clip_drag = Some(next);
 }
 
 fn finish_clip_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
     let Some(drag) = state.clip_drag.take() else {
         return;
     };
-    if drag.preview_start != drag.original_start {
-        actions.push(UiAction::Edit(EditCommand::MoveClip {
-            track: drag.track,
-            clip: drag.clip,
-            start: drag.preview_start,
-        }));
+    match drag.kind {
+        ClipDragKind::Move => {
+            if drag.preview_start != drag.original_start {
+                actions.push(UiAction::Edit(EditCommand::MoveClip {
+                    track: drag.track,
+                    clip: drag.clip,
+                    start: drag.preview_start,
+                }));
+            }
+        }
+        ClipDragKind::ResizeEnd => {
+            if drag.preview_length != drag.original_length {
+                actions.push(UiAction::Edit(EditCommand::ResizeClip {
+                    track: drag.track,
+                    clip: drag.clip,
+                    length: drag.preview_length,
+                }));
+            }
+        }
     }
 }
 
@@ -395,8 +548,9 @@ fn draw_track_clips(
             .clip_drag
             .filter(|drag| drag.track == track.id && drag.clip == clip.id);
         let display_start = dragging.map_or(clip.start.0, |drag| drag.preview_start.0);
+        let display_length = dragging.map_or(clip.length.0, |drag| drag.preview_length.0);
         let x0 = timeline_left + (display_start as f64 * px_per_tick) as f32;
-        let x1 = timeline_left + ((display_start + clip.length.0) as f64 * px_per_tick) as f32;
+        let x1 = timeline_left + ((display_start + display_length) as f64 * px_per_tick) as f32;
         let clip_rect = Rect::from_min_max(
             pos2(x0.max(timeline_left), lane_top + 7.0),
             pos2(x1.max(x0 + 2.0), lane_bottom - 7.0),
@@ -417,20 +571,41 @@ fn draw_track_clips(
             let origin = ui
                 .input(|input| input.pointer.press_origin())
                 .unwrap_or_else(|| clip_rect.center());
+            let edge_zone = (clip_rect.width() * 0.12).clamp(5.0, 9.0);
+            let kind = if clip_rect.width() > 16.0 && origin.x >= clip_rect.right() - edge_zone {
+                ClipDragKind::ResizeEnd
+            } else {
+                ClipDragKind::Move
+            };
             state.select_clip(track.id, clip.id);
             state.track_drag = None;
             state.clip_drag = Some(ClipDrag {
                 track: track.id,
                 clip: clip.id,
+                kind,
                 pointer_start_x: origin.x,
                 original_start: clip.start,
+                original_length: clip.length,
                 preview_start: clip.start,
+                preview_length: clip.length,
             });
         }
-        if dragging.is_some() {
-            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        if let Some(drag) = dragging {
+            ui.ctx().set_cursor_icon(match drag.kind {
+                ClipDragKind::Move => CursorIcon::Grabbing,
+                ClipDragKind::ResizeEnd => CursorIcon::ResizeHorizontal,
+            });
         } else if response.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+            let edge_zone = (clip_rect.width() * 0.12).clamp(5.0, 9.0);
+            let near_end = clip_rect.width() > 16.0
+                && ui
+                    .input(|input| input.pointer.hover_pos())
+                    .is_some_and(|pointer| pointer.x >= clip_rect.right() - edge_zone);
+            ui.ctx().set_cursor_icon(if near_end {
+                CursorIcon::ResizeHorizontal
+            } else {
+                CursorIcon::Grab
+            });
         }
         let selected =
             state.selected_track == Some(track.id) && state.selected_clip == Some(clip.id);

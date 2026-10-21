@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
-use octava_audio::{AudioEngine, TransportState};
+use octava_audio::{AudioEngine, PreviewNote, TransportState};
 use octava_core::{Project, ProjectStore, Ticks};
 use octava_render::{RenderSettings, render_wav};
 use octava_ui::{OctavaUi, PlaybackView, UiAction};
@@ -119,6 +119,32 @@ impl OctavaApp {
                 }
             }
             UiAction::NewProject => self.new_project(ctx),
+            UiAction::AuditionNote {
+                track,
+                key,
+                velocity,
+            } => {
+                if self.playback.playing {
+                    return;
+                }
+                let Some(track) = self.store.project().track(track) else {
+                    return;
+                };
+                let preview = PreviewNote {
+                    channel: track.channel,
+                    preset: track.preset,
+                    gain: track.gain,
+                    pan: track.pan,
+                    key,
+                    velocity,
+                };
+                if let Some(engine) = &mut self.engine
+                    && let Err(error) = engine.preview_note(preview)
+                {
+                    self.last_error = Some(error.to_string());
+                }
+                ctx.request_repaint();
+            }
             UiAction::ExportWav => {
                 self.export_open = true;
                 self.export_path = default_export_path(self.store.project());

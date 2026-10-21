@@ -4,9 +4,11 @@ use fluidlite::{FontId, Synth};
 use octava_core::{EventKind, PlaybackSnapshot, Ticks, TimedEvent};
 use rtrb::{Consumer, Producer};
 
-use crate::engine::{AudioCommand, AudioTelemetry, TransportState};
+use crate::engine::{AudioCommand, AudioTelemetry, PreviewNote, TransportState};
 
 const TICK_EPSILON: f64 = 1.0e-9;
+const PREVIEW_SECONDS: f64 = 0.4;
+const PREVIEW_NOTE_OFF_SECONDS: f64 = 0.24;
 
 pub(crate) struct Runtime {
     synth: Synth,
@@ -22,6 +24,11 @@ pub(crate) struct Runtime {
     telemetry: Arc<AudioTelemetry>,
     peak_left: f32,
     peak_right: f32,
+    preview_frames: usize,
+    preview_note_off_frames: usize,
+    preview_channel: u32,
+    preview_key: u32,
+    preview_released: bool,
 }
 
 impl Runtime {
@@ -47,6 +54,11 @@ impl Runtime {
             telemetry,
             peak_left: 0.0,
             peak_right: 0.0,
+            preview_frames: 0,
+            preview_note_off_frames: 0,
+            preview_channel: 0,
+            preview_key: 0,
+            preview_released: true,
         };
         runtime.publish();
         runtime
@@ -56,12 +68,7 @@ impl Runtime {
         self.process_commands();
 
         if self.state != TransportState::Playing {
-            left.fill(0.0);
-            right.fill(0.0);
-            self.peak_left = 0.0;
-            self.peak_right = 0.0;
-            self.publish();
-            return 0;
+            return self.render_preview(left, right);
         }
 
         let Some(snapshot) = self.snapshot.clone() else {
@@ -171,12 +178,14 @@ impl Runtime {
                 AudioCommand::Stop => self.stop(),
                 AudioCommand::Seek(tick) => self.seek(tick),
                 AudioCommand::SetSnapshot(snapshot) => self.replace_snapshot(snapshot),
+                AudioCommand::PreviewNote(note) => self.preview_note(note),
             }
         }
     }
 
     fn start(&mut self, snapshot: Arc<PlaybackSnapshot>, start: Ticks) {
         let start = start.min(snapshot.length);
+        self.clear_preview();
         self.retire_snapshot();
         self.position_seconds = snapshot.tempo_map.seconds_at(start);
         self.end_seconds = snapshot.tempo_map.seconds_at(snapshot.length);
@@ -192,6 +201,8 @@ impl Runtime {
 
     fn resume(&mut self) {
         if self.snapshot.is_some() && self.position_seconds < self.end_seconds - TICK_EPSILON {
+            self.clear_preview();
+            self.reset_synth();
             self.state = TransportState::Playing;
         }
     }
@@ -200,13 +211,16 @@ impl Runtime {
         self.state = TransportState::Stopped;
         self.position_seconds = 0.0;
         self.event_index = 0;
+        self.clear_preview();
         self.reset_synth();
     }
 
     fn seek(&mut self, tick: Ticks) {
+        self.clear_preview();
         let Some(snapshot) = self.snapshot.clone() else {
             self.position_seconds = 0.0;
             self.event_index = 0;
+            self.reset_synth();
             return;
         };
         let tick = tick.min(snapshot.length);
@@ -222,6 +236,7 @@ impl Runtime {
 
     fn replace_snapshot(&mut self, snapshot: Arc<PlaybackSnapshot>) {
         let tick = self.current_tick();
+        self.clear_preview();
         self.retire_snapshot();
         self.position_seconds = snapshot.tempo_map.seconds_at(tick.min(snapshot.length));
         self.end_seconds = snapshot.tempo_map.seconds_at(snapshot.length);
@@ -255,6 +270,72 @@ impl Runtime {
                 let _ = self.synth.cc(channel, 10, pan.min(127));
             }
         }
+    }
+
+    fn render_preview(&mut self, left: &mut [f32], right: &mut [f32]) -> usize {
+        if self.preview_frames == 0 {
+            left.fill(0.0);
+            right.fill(0.0);
+            self.peak_left = 0.0;
+            self.peak_right = 0.0;
+            self.publish();
+            return 0;
+        }
+
+        let frames = self.preview_frames.min(left.len());
+        self.render_frames(&mut left[..frames], &mut right[..frames]);
+        self.preview_frames -= frames;
+
+        if !self.preview_released && self.preview_frames <= self.preview_note_off_frames {
+            self.preview_released = true;
+            let _ = self.synth.note_off(self.preview_channel, self.preview_key);
+        }
+
+        if frames < left.len() {
+            left[frames..].fill(0.0);
+            right[frames..].fill(0.0);
+        }
+
+        self.peak_left = peak(&left[..frames]);
+        self.peak_right = peak(&right[..frames]);
+        self.publish();
+        frames
+    }
+
+    fn preview_note(&mut self, note: PreviewNote) {
+        if self.state == TransportState::Playing {
+            return;
+        }
+
+        self.clear_preview();
+        let channel = u32::from(note.channel.min(15));
+        let _ = self.synth.system_reset();
+        let _ = self.synth.program_select(
+            channel,
+            self.font_id,
+            u32::from(note.preset.bank),
+            u32::from(note.preset.program),
+        );
+        let volume = (note.gain.clamp(0.0, 1.0) * 127.0).round() as u32;
+        let pan = ((note.pan.clamp(-1.0, 1.0) + 1.0) * 63.5).round() as u32;
+        let _ = self.synth.cc(channel, 7, volume);
+        let _ = self.synth.cc(channel, 10, pan.min(127));
+        let _ = self
+            .synth
+            .note_on(channel, u32::from(note.key), u32::from(note.velocity));
+
+        self.preview_frames = (self.sample_rate * PREVIEW_SECONDS).round() as usize;
+        self.preview_note_off_frames =
+            (self.sample_rate * (PREVIEW_SECONDS - PREVIEW_NOTE_OFF_SECONDS)).round() as usize;
+        self.preview_channel = channel;
+        self.preview_key = u32::from(note.key);
+        self.preview_released = false;
+    }
+
+    fn clear_preview(&mut self) {
+        self.preview_frames = 0;
+        self.preview_note_off_frames = 0;
+        self.preview_released = true;
     }
 
     fn trigger(&self, event: TimedEvent) {
@@ -371,6 +452,33 @@ mod tests {
         render(&mut harness.runtime, 100);
         assert_eq!(harness.telemetry.state(), TransportState::Paused);
         assert_eq!(harness.telemetry.playhead(), Ticks(1920));
+    }
+
+    #[test]
+    fn preview_renders_while_stopped_without_moving_the_transport() {
+        let mut harness = harness();
+        harness
+            .commands
+            .push(AudioCommand::PreviewNote(PreviewNote {
+                channel: 0,
+                preset: octava_core::Preset::default(),
+                gain: 1.0,
+                pan: 0.0,
+                key: 60,
+                velocity: 100,
+            }))
+            .unwrap();
+
+        render(&mut harness.runtime, 2);
+        assert_eq!(harness.telemetry.state(), TransportState::Stopped);
+        assert_eq!(harness.telemetry.playhead(), Ticks::ZERO);
+        let (left, right) = harness.telemetry.peaks();
+        assert!(left > 0.0 || right > 0.0);
+
+        render(&mut harness.runtime, 100);
+        let (left, right) = harness.telemetry.peaks();
+        assert_eq!(left, 0.0);
+        assert_eq!(right, 0.0);
     }
 
     #[test]

@@ -47,6 +47,11 @@ pub enum EditCommand {
         clip: ClipId,
         start: Ticks,
     },
+    ResizeClip {
+        track: TrackId,
+        clip: ClipId,
+        length: Ticks,
+    },
     AddNote {
         track: TrackId,
         clip: ClipId,
@@ -195,6 +200,18 @@ pub(crate) fn apply(
         EditCommand::MoveClip { track, clip, start } => {
             let (track_index, clip_index) = locate_clip(project, *track, *clip)?;
             project.tracks[track_index].clips[clip_index].start = *start;
+            outcome.clip = Some(*clip);
+        }
+        EditCommand::ResizeClip {
+            track,
+            clip,
+            length,
+        } => {
+            if *length == Ticks::ZERO {
+                return Err(ModelError::InvalidClipLength);
+            }
+            let (track_index, clip_index) = locate_clip(project, *track, *clip)?;
+            project.tracks[track_index].clips[clip_index].length = *length;
             outcome.clip = Some(*clip);
         }
         EditCommand::AddNote {
@@ -359,6 +376,47 @@ mod tests {
         let track = project.add_track("Piano").unwrap();
         let clip = project.add_clip(track, Ticks::ZERO, Ticks(3840)).unwrap();
         (ProjectStore::new(project), track, clip)
+    }
+
+    #[test]
+    fn resize_clip_validates_length_and_supports_undo() {
+        let (mut store, track, clip) = fixture();
+
+        store
+            .apply(EditCommand::ResizeClip {
+                track,
+                clip,
+                length: Ticks(7680),
+            })
+            .unwrap();
+        let length = store
+            .project()
+            .track(track)
+            .unwrap()
+            .clip(clip)
+            .unwrap()
+            .length;
+        assert_eq!(length, Ticks(7680));
+
+        assert!(
+            store
+                .apply(EditCommand::ResizeClip {
+                    track,
+                    clip,
+                    length: Ticks::ZERO,
+                })
+                .is_err()
+        );
+
+        store.undo();
+        let length = store
+            .project()
+            .track(track)
+            .unwrap()
+            .clip(clip)
+            .unwrap()
+            .length;
+        assert_eq!(length, Ticks(3840));
     }
 
     #[test]
