@@ -228,7 +228,7 @@ fn clips_section(ui: &mut egui::Ui, project: &Project, state: &mut UiState) {
             .selectable_label(selected, RichText::new(label).size(11.0))
             .clicked()
         {
-            state.selected_clip = Some(clip.id);
+            state.select_clip(track.id, clip.id);
         }
     }
 }

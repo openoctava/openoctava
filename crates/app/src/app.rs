@@ -1,9 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
 use octava_audio::{AudioEngine, TransportState};
-use octava_core::{ProjectStore, Ticks};
+use octava_core::{Project, ProjectStore, Ticks};
+use octava_render::{RenderSettings, render_wav};
 use octava_ui::{OctavaUi, PlaybackView, UiAction};
 
 use crate::demo::demo_project;
@@ -17,6 +19,9 @@ pub struct OctavaApp {
     engine: Option<AudioEngine>,
     last_audio_revision: u64,
     last_error: Option<String>,
+    notice: Option<String>,
+    export_open: bool,
+    export_path: String,
 }
 
 impl OctavaApp {
@@ -44,6 +49,9 @@ impl OctavaApp {
             engine,
             last_audio_revision,
             last_error: None,
+            notice: None,
+            export_open: false,
+            export_path: String::new(),
         }
     }
 
@@ -100,7 +108,47 @@ impl OctavaApp {
                     self.last_error = Some(error.to_string());
                 }
             }
+            UiAction::Undo => {
+                if !self.store.undo() {
+                    self.last_error = Some("Nothing to undo".to_owned());
+                }
+            }
+            UiAction::Redo => {
+                if !self.store.redo() {
+                    self.last_error = Some("Nothing to redo".to_owned());
+                }
+            }
+            UiAction::NewProject => self.new_project(ctx),
+            UiAction::ExportWav => {
+                self.export_open = true;
+                self.export_path = default_export_path(self.store.project());
+            }
         }
+    }
+
+    fn new_project(&mut self, ctx: &egui::Context) {
+        self.playback.playing = false;
+        self.playback.playhead = Ticks::ZERO;
+        self.playback.peak_left = 0.0;
+        self.playback.peak_right = 0.0;
+        if let Some(engine) = &mut self.engine
+            && let Err(error) = engine.stop()
+        {
+            self.last_error = Some(error.to_string());
+        }
+
+        let mut project = Project::new("Untitled");
+        if let Ok(track) = project.add_track("Instrument") {
+            let bar = project
+                .time_signature
+                .ticks_per_bar(project.tempo_map.ppq());
+            let _ = project.add_clip(track, Ticks::ZERO, Ticks(bar.saturating_mul(4)));
+        }
+        self.store = ProjectStore::new(project);
+        self.last_audio_revision = self.store.revision();
+        self.last_error = None;
+        self.notice = None;
+        ctx.request_repaint();
     }
 
     fn toggle_playback(&mut self, ctx: &egui::Context) {
@@ -243,6 +291,30 @@ impl eframe::App for OctavaApp {
             self.advance_transport(&ctx);
         }
 
+        if self.export_open {
+            export_dialog(
+                &ctx,
+                &mut self.export_open,
+                &mut self.export_path,
+                self.store.project(),
+                &mut self.last_error,
+                &mut self.notice,
+            );
+        }
+
+        if let Some(message) = self.notice.clone() {
+            egui::Window::new("Export complete")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -64.0])
+                .show(&ctx, |ui| {
+                    ui.label(message);
+                    if ui.button("Dismiss").clicked() {
+                        self.notice = None;
+                    }
+                });
+        }
+
         if let Some(error) = self.last_error.clone() {
             egui::Window::new("Command failed")
                 .collapsible(false)
@@ -255,5 +327,89 @@ impl eframe::App for OctavaApp {
                     }
                 });
         }
+    }
+}
+
+fn default_export_path(project: &Project) -> String {
+    let mut slug = project
+        .name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let slug = slug.trim_matches('-');
+    let name = if slug.is_empty() { "octava" } else { slug };
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(format!("{name}.wav"))
+        .display()
+        .to_string()
+}
+
+fn export_dialog(
+    ctx: &egui::Context,
+    open: &mut bool,
+    path: &mut String,
+    project: &Project,
+    last_error: &mut Option<String>,
+    notice: &mut Option<String>,
+) {
+    let mut close_requested = false;
+    egui::Window::new("Export WAV")
+        .open(open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label("Output file");
+            ui.add(
+                egui::TextEdit::singleline(path)
+                    .desired_width(420.0)
+                    .hint_text("path/to/output.wav"),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Stereo 16-bit PCM · 44.1 kHz · 1 s release tail")
+                    .size(10.0)
+                    .color(egui::Color32::GRAY),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Render WAV").clicked() {
+                    let mut output = PathBuf::from(path.trim());
+                    if output.as_os_str().is_empty() {
+                        *last_error = Some("Export path must not be empty".to_owned());
+                        return;
+                    }
+                    if output.extension().is_none() {
+                        output.set_extension("wav");
+                    }
+                    *path = output.display().to_string();
+                    match render_wav(project, &output, RenderSettings::default()) {
+                        Ok(()) => {
+                            *notice = Some(format!("Rendered {}", output.display()));
+                            *last_error = None;
+                            close_requested = true;
+                        }
+                        Err(error) => {
+                            *last_error = Some(error.to_string());
+                        }
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    close_requested = true;
+                }
+            });
+        });
+    if close_requested {
+        *open = false;
     }
 }

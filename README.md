@@ -10,7 +10,8 @@ The project is under active development. The current foundation includes:
 - A native `egui` interface with a timeline, piano roll, inspector, transport, and custom titlebar.
 - A real-time audio engine built on `cpal` and FluidLite with SoundFont 2 playback.
 - Offline WAV rendering that reuses the same scheduler and synthesizer as live playback.
-- Piano-roll note editing and timeline clip movement with configurable snapping.
+- Piano-roll note creation, movement, resizing, and deletion; timeline clip movement and track reordering with configurable snapping.
+- WAV export from the Export menu, reusing the live audio scheduler.
 
 ## Architecture
 
@@ -66,7 +67,7 @@ You can point OpenOctava at another SoundFont by setting `OCTAVA_SF2` to its pat
 
 - Project save/load and recent files
 - MP3 export
-- Track reordering and richer clip editing
+- Richer clip editing (trim and split)
 - Audio device selection and latency settings
 - Metronome, MIDI input, and automation
 

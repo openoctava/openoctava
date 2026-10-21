@@ -1,7 +1,9 @@
-use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
-use octava_core::{Project, Ticks, Track};
+use egui::{
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, Sense, Stroke, StrokeKind, pos2, vec2,
+};
+use octava_core::{EditCommand, Project, Ticks, Track};
 
-use crate::state::{PlaybackView, UiAction, UiState};
+use crate::state::{ClipDrag, PlaybackView, TrackDrag, UiAction, UiState};
 use crate::theme;
 
 const HEADER_WIDTH: f32 = 168.0;
@@ -26,9 +28,6 @@ pub(crate) fn show(
     let bar_ticks = project
         .time_signature
         .ticks_per_bar(project.tempo_map.ppq()) as f64;
-    let beat_ticks = project
-        .time_signature
-        .ticks_per_beat(project.tempo_map.ppq()) as f64;
     let timeline_left = rect.left() + HEADER_WIDTH;
     let timeline_width = (rect.width() - HEADER_WIDTH).max(1.0);
     let project_bars = (project.length_ticks().0 as f64 / bar_ticks).ceil() as u64;
@@ -38,6 +37,18 @@ pub(crate) fn show(
 
     let timeline_rect = Rect::from_min_max(pos2(timeline_left, rect.top()), rect.max);
     let max_lanes = ((rect.height() - RULER_HEIGHT) / LANE_HEIGHT).floor() as usize;
+    let visible_tracks = project.tracks.len().min(max_lanes);
+
+    if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
+        update_clip_drag(project, state, px_per_tick, pointer.x);
+        update_track_drag(
+            project,
+            state,
+            pointer.y,
+            rect.top() + RULER_HEIGHT,
+            visible_tracks,
+        );
+    }
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(
@@ -87,7 +98,6 @@ pub(crate) fn show(
         );
     }
 
-    let visible_tracks = project.tracks.len().min(max_lanes);
     for (index, track) in project.tracks.iter().take(visible_tracks).enumerate() {
         let lane_top = rect.top() + RULER_HEIGHT + index as f32 * LANE_HEIGHT;
         let lane_bottom = (lane_top + LANE_HEIGHT).min(rect.bottom());
@@ -98,12 +108,29 @@ pub(crate) fn show(
         let header_response = ui.interact(
             header_rect,
             ui.id().with(("timeline-track", track.id.0)),
-            Sense::click(),
+            Sense::click_and_drag(),
         );
         if header_response.clicked() {
             state.select_track(project, track.id);
         }
+        if header_response.drag_started() {
+            state.select_track(project, track.id);
+            state.clip_drag = None;
+            state.track_drag = Some(TrackDrag {
+                track: track.id,
+                original_index: index,
+                target_index: index,
+            });
+        }
+        if state.track_drag.is_some_and(|drag| drag.track == track.id) {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if header_response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
         let selected = state.selected_track == Some(track.id);
+        let drop_target = state
+            .track_drag
+            .is_some_and(|drag| drag.target_index == index && drag.original_index != index);
         let color = theme::track_color(index);
 
         let row_fill = if selected {
@@ -135,6 +162,14 @@ pub(crate) fn show(
             ],
             Stroke::new(1.0, theme::GRID_LINE),
         );
+        if drop_target {
+            painter.rect_stroke(
+                Rect::from_min_max(header_rect.min, pos2(header_rect.right(), lane_bottom)),
+                CornerRadius::ZERO,
+                Stroke::new(2.0, theme::ACCENT),
+                StrokeKind::Inside,
+            );
+        }
 
         draw_track_header(ui, track, header_rect, selected);
         draw_track_clips(
@@ -202,9 +237,86 @@ pub(crate) fn show(
         && pointer.x >= timeline_left
     {
         let tick = ((pointer.x - timeline_left) as f64 / px_per_tick).max(0.0);
-        let step = (beat_ticks / 4.0).max(1.0);
-        let snapped = ((tick / step).round() * step) as u64;
-        actions.push(UiAction::Seek(Ticks(snapped)));
+        actions.push(UiAction::Seek(Ticks(
+            state.snap.snap_tick(tick, project.tempo_map.ppq()),
+        )));
+    }
+
+    if ui.input(|input| input.pointer.any_released()) {
+        finish_clip_drag(state, actions);
+        finish_track_drag(state, actions);
+    }
+}
+
+fn update_track_drag(
+    project: &Project,
+    state: &mut UiState,
+    pointer_y: f32,
+    lanes_top: f32,
+    visible_tracks: usize,
+) {
+    let Some(drag) = state.track_drag else {
+        return;
+    };
+    if project.track(drag.track).is_none() || visible_tracks == 0 {
+        state.track_drag = None;
+        return;
+    }
+
+    let lane = ((pointer_y - lanes_top) / LANE_HEIGHT).floor();
+    let target = lane.clamp(0.0, (visible_tracks - 1) as f32) as usize;
+    state.track_drag = Some(TrackDrag {
+        target_index: target,
+        ..drag
+    });
+}
+
+fn finish_track_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
+    let Some(drag) = state.track_drag.take() else {
+        return;
+    };
+    if drag.target_index != drag.original_index {
+        actions.push(UiAction::Edit(EditCommand::MoveTrack {
+            track: drag.track,
+            to_index: drag.target_index,
+        }));
+    }
+}
+
+fn update_clip_drag(project: &Project, state: &mut UiState, px_per_tick: f64, pointer_x: f32) {
+    let Some(drag) = state.clip_drag else {
+        return;
+    };
+    let exists = project
+        .track(drag.track)
+        .and_then(|track| track.clip(drag.clip))
+        .is_some();
+    if !exists {
+        state.clip_drag = None;
+        return;
+    }
+
+    let delta = (pointer_x - drag.pointer_start_x) as f64 / px_per_tick;
+    let start = state.snap.snap_tick(
+        drag.original_start.0 as f64 + delta,
+        project.tempo_map.ppq(),
+    );
+    state.clip_drag = Some(ClipDrag {
+        preview_start: Ticks(start),
+        ..drag
+    });
+}
+
+fn finish_clip_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
+    let Some(drag) = state.clip_drag.take() else {
+        return;
+    };
+    if drag.preview_start != drag.original_start {
+        actions.push(UiAction::Edit(EditCommand::MoveClip {
+            track: drag.track,
+            clip: drag.clip,
+            start: drag.preview_start,
+        }));
     }
 }
 
@@ -279,8 +391,12 @@ fn draw_track_clips(
     ));
 
     for clip in &track.clips {
-        let x0 = timeline_left + (clip.start.0 as f64 * px_per_tick) as f32;
-        let x1 = timeline_left + (clip.end().0 as f64 * px_per_tick) as f32;
+        let dragging = state
+            .clip_drag
+            .filter(|drag| drag.track == track.id && drag.clip == clip.id);
+        let display_start = dragging.map_or(clip.start.0, |drag| drag.preview_start.0);
+        let x0 = timeline_left + (display_start as f64 * px_per_tick) as f32;
+        let x1 = timeline_left + ((display_start + clip.length.0) as f64 * px_per_tick) as f32;
         let clip_rect = Rect::from_min_max(
             pos2(x0.max(timeline_left), lane_top + 7.0),
             pos2(x1.max(x0 + 2.0), lane_bottom - 7.0),
@@ -292,11 +408,29 @@ fn draw_track_clips(
         let response = ui.interact(
             clip_rect,
             ui.id().with(("timeline-clip", clip.id.0)),
-            Sense::click(),
+            Sense::click_and_drag(),
         );
         if response.clicked() {
-            state.selected_track = Some(track.id);
-            state.selected_clip = Some(clip.id);
+            state.select_clip(track.id, clip.id);
+        }
+        if response.drag_started() {
+            let origin = ui
+                .input(|input| input.pointer.press_origin())
+                .unwrap_or_else(|| clip_rect.center());
+            state.select_clip(track.id, clip.id);
+            state.track_drag = None;
+            state.clip_drag = Some(ClipDrag {
+                track: track.id,
+                clip: clip.id,
+                pointer_start_x: origin.x,
+                original_start: clip.start,
+                preview_start: clip.start,
+            });
+        }
+        if dragging.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
         }
         let selected =
             state.selected_track == Some(track.id) && state.selected_clip == Some(clip.id);

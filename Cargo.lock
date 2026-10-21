@@ -2419,6 +2419,7 @@ dependencies = [
  "egui",
  "octava-audio",
  "octava-core",
+ "octava-render",
  "octava-ui",
 ]
 

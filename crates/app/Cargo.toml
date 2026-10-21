@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 octava-core.workspace = true
 octava-audio.workspace = true
+octava-render.workspace = true
 octava-ui.workspace = true
 egui.workspace = true
 eframe.workspace = true

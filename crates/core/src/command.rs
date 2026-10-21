@@ -17,6 +17,10 @@ pub enum EditCommand {
     RemoveTrack {
         track: TrackId,
     },
+    MoveTrack {
+        track: TrackId,
+        to_index: usize,
+    },
     SetTrackName {
         track: TrackId,
         name: String,
@@ -111,6 +115,18 @@ pub(crate) fn apply(
                 .track_index(*track)
                 .ok_or(ModelError::TrackNotFound(*track))?;
             project.tracks.remove(index);
+            outcome.track = Some(*track);
+        }
+        EditCommand::MoveTrack { track, to_index } => {
+            let from = project
+                .track_index(*track)
+                .ok_or(ModelError::TrackNotFound(*track))?;
+            let last = project.tracks.len().saturating_sub(1);
+            let to = (*to_index).min(last);
+            if from != to {
+                let stored = project.tracks.remove(from);
+                project.tracks.insert(to, stored);
+            }
             outcome.track = Some(*track);
         }
         EditCommand::SetTrackName { track, name } => {
@@ -343,6 +359,47 @@ mod tests {
         let track = project.add_track("Piano").unwrap();
         let clip = project.add_clip(track, Ticks::ZERO, Ticks(3840)).unwrap();
         (ProjectStore::new(project), track, clip)
+    }
+
+    #[test]
+    fn move_track_reorders_and_clamps() {
+        let mut project = Project::new("Test");
+        let first = project.add_track("First").unwrap();
+        let second = project.add_track("Second").unwrap();
+        let third = project.add_track("Third").unwrap();
+        let mut store = ProjectStore::new(project);
+
+        store
+            .apply(EditCommand::MoveTrack {
+                track: first,
+                to_index: 99,
+            })
+            .unwrap();
+        let order = store
+            .project()
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![second, third, first]);
+
+        store.undo();
+        let order = store
+            .project()
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![first, second, third]);
+
+        assert!(
+            store
+                .apply(EditCommand::MoveTrack {
+                    track: first,
+                    to_index: 1,
+                })
+                .is_ok()
+        );
     }
 
     #[test]

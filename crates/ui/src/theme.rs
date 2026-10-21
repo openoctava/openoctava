@@ -15,6 +15,7 @@ pub const ACCENT_SOFT: Color32 = Color32::from_rgba_premultiplied(72, 49, 27, 25
 pub const KEY_WHITE: Color32 = Color32::from_rgb(190, 195, 202);
 pub const KEY_BLACK: Color32 = Color32::from_rgb(42, 47, 55);
 pub const RULER: Color32 = Color32::from_rgb(25, 28, 34);
+pub const TITLEBAR: Color32 = Color32::from_rgb(17, 19, 23);
 
 const TRACK_COLORS: [Color32; 6] = [
     Color32::from_rgb(232, 165, 83),
