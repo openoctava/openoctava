@@ -16,7 +16,7 @@ use egui::{
     WidgetText, vec2,
 };
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
-use octava_core::{EditCommand, Project};
+use octava_core::{EditCommand, Project, Ticks};
 
 use state::UiState;
 pub use state::{PlaybackView, UiAction};
@@ -92,7 +92,7 @@ impl OctavaUi {
         let mut actions = Vec::new();
 
         self.title_bar(ui, project, playback, &mut actions);
-        transport_bar(ui, project, playback, &mut actions);
+        transport_bar(ui, project, playback, &mut self.state, &mut actions);
         status_bar(ui, project, playback);
 
         let Self {
@@ -463,6 +463,7 @@ fn transport_bar(
     ui: &mut egui::Ui,
     project: &Project,
     playback: &PlaybackView,
+    state: &mut UiState,
     actions: &mut Vec<UiAction>,
 ) {
     egui::Panel::top("octava-transport")
@@ -523,14 +524,40 @@ fn transport_bar(
                         .color(theme::TEXT),
                 );
                 ui.separator();
-                ui.label(
-                    RichText::new(format!(
-                        "{:.1} BPM",
-                        project.tempo_map.tempo_at(playback.playhead)
-                    ))
-                    .size(11.5)
-                    .color(theme::TEXT_DIM),
+                let tempo_tick = project
+                    .tempo_map
+                    .segments()
+                    .iter()
+                    .rev()
+                    .find(|segment| segment.start <= playback.playhead)
+                    .map_or(Ticks::ZERO, |segment| segment.start);
+                let stored_bpm = project.tempo_map.tempo_at(playback.playhead);
+                let mut bpm = state
+                    .tempo_drag
+                    .filter(|drag| drag.tick == tempo_tick)
+                    .map_or(stored_bpm, |drag| drag.bpm);
+                let bpm_response = ui.add(
+                    egui::DragValue::new(&mut bpm)
+                        .range(20.0..=400.0)
+                        .speed(0.25)
+                        .fixed_decimals(1)
+                        .suffix(" BPM"),
                 );
+                if bpm_response.changed() {
+                    state.tempo_drag = Some(state::TempoDrag {
+                        tick: tempo_tick,
+                        bpm,
+                    });
+                }
+                if (bpm_response.drag_stopped() || bpm_response.lost_focus())
+                    && let Some(drag) = state.tempo_drag.take()
+                    && (drag.bpm - project.tempo_map.tempo_at(drag.tick)).abs() > 0.000_1
+                {
+                    actions.push(UiAction::Edit(EditCommand::SetTempo {
+                        tick: drag.tick,
+                        bpm: drag.bpm,
+                    }));
+                }
                 ui.label(
                     RichText::new(format!(
                         "{}/{}",

@@ -157,4 +157,32 @@ mod tests {
             "the note ending on the last tick was never released"
         );
     }
+
+    #[test]
+    fn pan_moves_the_signal_between_channels() {
+        let mut project = Project::new("Pan");
+        let track = project.add_track("Piano").unwrap();
+        project.track_mut(track).unwrap().pan = -1.0;
+        let pattern = project.add_pattern("Clip", Ticks(1920)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
+        project
+            .add_note(pattern, 60, 100, Ticks::ZERO, Ticks(960))
+            .unwrap();
+
+        let mut renderer = OfflineRenderer::new(44_100).unwrap();
+        let output = renderer
+            .render(Arc::new(project.compile_snapshot()), 0.1)
+            .unwrap();
+
+        let mut peak_left = 0.0_f32;
+        let mut peak_right = 0.0_f32;
+        for frame in output.as_chunks::<2>().0 {
+            peak_left = peak_left.max(frame[0].abs());
+            peak_right = peak_right.max(frame[1].abs());
+        }
+        assert!(
+            peak_left > peak_right * 2.0,
+            "panning left should favour the left channel: {peak_left} vs {peak_right}"
+        );
+    }
 }

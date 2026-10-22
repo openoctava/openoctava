@@ -77,6 +77,7 @@ pub(crate) fn show(
     draw_pattern_region(ui, &grid, pattern, pattern_index);
     draw_grid_lines(ui, project, &grid, rect, state.snap);
     draw_notes(ui, &grid, pattern, pattern_index, state);
+    draw_pending_note(ui, project, pattern, pattern_index, &grid, state);
     draw_ruler(ui, project, &grid, rect);
 
     if pattern.notes.is_empty() {
@@ -99,7 +100,7 @@ pub(crate) fn show(
     ui.painter_at(rect).text(
         pos2(rect.right() - 8.0, rect.bottom() - 6.0),
         Align2::RIGHT_BOTTOM,
-        "click: add note  ·  drag: move/audition  ·  drag edge: resize  ·  Del: delete  ·  Ctrl+wheel: zoom",
+        "click: add note  ·  drag: move/audition  ·  drag edge: resize  ·  right-click: delete  ·  wheel: scroll  ·  Shift+wheel: keys  ·  Ctrl+wheel: zoom",
         FontId::proportional(9.5),
         theme::TEXT_FAINT,
     );
@@ -233,10 +234,14 @@ fn handle_input(
             let px_per_tick = (f64::from(state.piano_roll.px_per_beat)
                 / f64::from(project.tempo_map.ppq())) as f32;
             if shift {
-                state.piano_roll.left_tick -= f64::from(scroll.y / px_per_tick);
+                // Shift+wheel moves the keyboard vertically.
+                let dy = if scroll.y != 0.0 { scroll.y } else { scroll.x };
+                state.piano_roll.scroll_y -= dy;
             } else {
-                state.piano_roll.left_tick -= f64::from(scroll.x / px_per_tick);
-                state.piano_roll.scroll_y -= scroll.y;
+                // The plain wheel scrolls the pattern horizontally, so that a
+                // mouse without a horizontal axis can still pan the view.
+                let dx = if scroll.y != 0.0 { scroll.y } else { scroll.x };
+                state.piano_roll.left_tick -= f64::from(dx / px_per_tick);
             }
         }
     }
@@ -323,6 +328,20 @@ fn handle_input(
         }
     }
 
+    if response.secondary_clicked()
+        && let Some(pointer) = response.interact_pointer_pos()
+        && let Some(hit) = hit_test_note(pattern, grid, pointer)
+    {
+        actions.push(UiAction::Edit(EditCommand::RemoveNotes {
+            pattern: pattern.id,
+            notes: vec![hit.note.note],
+        }));
+        if state.selected_note == Some(hit.note) {
+            state.selected_note = None;
+        }
+        state.note_drag = None;
+    }
+
     if response.clicked()
         && let Some(pointer) = response.interact_pointer_pos()
     {
@@ -340,27 +359,15 @@ fn handle_input(
             return;
         }
 
-        let tick = state
-            .snap
-            .snap_tick(grid.x_to_tick(pointer.x), project.tempo_map.ppq());
-        if tick < pattern.length.0 {
-            let available = pattern.length.0.saturating_sub(tick);
-            let length = state
-                .snap
-                .division
-                .ticks(project.tempo_map.ppq())
-                .min(available);
-            if length > 0 {
-                let key = key_at_y(grid, pointer.y);
-                state.selected_note = None;
-                actions.push(UiAction::Edit(EditCommand::AddNote {
-                    pattern: pattern.id,
-                    key,
-                    velocity: 100,
-                    start: Ticks(tick),
-                    length: Ticks(length),
-                }));
-            }
+        if let Some(pending) = pending_note(project, pattern, grid, state.snap, pointer) {
+            state.selected_note = None;
+            actions.push(UiAction::Edit(EditCommand::AddNote {
+                pattern: pattern.id,
+                key: pending.key,
+                velocity: 100,
+                start: Ticks(pending.tick),
+                length: Ticks(pending.length),
+            }));
         }
     }
 
@@ -483,6 +490,43 @@ fn delete_selected_note(state: &mut UiState, actions: &mut Vec<UiAction>) {
 fn key_at_y(grid: &Grid, y: f32) -> u8 {
     let key = 127.0 - (y - grid.rect.top() + grid.scroll_y) / grid.key_height;
     key.floor().clamp(0.0, 127.0) as u8
+}
+
+/// The note that a click at `pointer` would create, after snapping.
+struct PendingNote {
+    tick: u64,
+    length: u64,
+    key: u8,
+}
+
+fn pending_note(
+    project: &Project,
+    pattern: &Pattern,
+    grid: &Grid,
+    snap: SnapSettings,
+    pointer: egui::Pos2,
+) -> Option<PendingNote> {
+    if !grid.rect.contains(pointer) {
+        return None;
+    }
+
+    let ppq = project.tempo_map.ppq();
+    let tick = snap.snap_tick(grid.x_to_tick(pointer.x), ppq);
+    if tick >= pattern.length.0 {
+        return None;
+    }
+
+    let available = pattern.length.0.saturating_sub(tick);
+    let length = snap.division.ticks(ppq).min(available);
+    if length == 0 {
+        return None;
+    }
+
+    Some(PendingNote {
+        tick,
+        length,
+        key: key_at_y(grid, pointer.y),
+    })
 }
 
 struct NoteHit {
@@ -785,27 +829,19 @@ fn draw_notes(
             },
         );
         let start = relative_start as f64;
-        let end = start + length as f64;
-        let x0 = grid.tick_to_x(start);
-        let x1 = grid.tick_to_x(end);
+        let note_rect = note_screen_rect(grid, relative_start, length, key);
+        let x1 = grid.tick_to_x(start + length as f64);
         let y = grid.key_y(key);
 
         if x1 < grid.rect.left()
-            || x0 > grid.rect.right()
+            || note_rect.left() > grid.rect.right()
             || y + grid.key_height < grid.rect.top()
             || y > grid.rect.bottom()
         {
             continue;
         }
 
-        let left = x0.max(grid.rect.left()) + 1.0;
-        let right = x1.min(grid.rect.right());
-        let width = (right - left).max(2.0);
-        let note_rect = Rect::from_min_size(
-            pos2(left, y + 1.0),
-            vec2(width, (grid.key_height - 2.0).max(2.0)),
-        )
-        .intersect(grid.rect);
+        let note_rect = note_rect.intersect(grid.rect);
         if note_rect.width() <= 0.0 || note_rect.height() <= 0.0 {
             continue;
         }
@@ -1035,4 +1071,44 @@ fn draw_tool_icon(painter: &egui::Painter, rect: Rect, icon: ToolIcon, color: Co
             }
         }
     }
+}
+
+fn draw_pending_note(
+    ui: &egui::Ui,
+    project: &Project,
+    pattern: &Pattern,
+    pattern_index: usize,
+    grid: &Grid,
+    state: &UiState,
+) {
+    if state.note_drag.is_some() {
+        return;
+    }
+
+    let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+        return;
+    };
+    // Hovering an existing note selects it instead of adding a new one.
+    if hit_test_note(pattern, grid, pointer).is_some() {
+        return;
+    }
+    let Some(pending) = pending_note(project, pattern, grid, state.snap, pointer) else {
+        return;
+    };
+
+    let rect =
+        note_screen_rect(grid, pending.tick, pending.length, pending.key).intersect(grid.rect);
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+
+    let color = theme::pattern_color(pattern_index);
+    let painter = ui.painter_at(grid.rect);
+    painter.rect_filled(rect, CornerRadius::same(3), color.gamma_multiply(0.22));
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(3),
+        Stroke::new(1.0, color.gamma_multiply(0.75)),
+        StrokeKind::Inside,
+    );
 }

@@ -1,6 +1,6 @@
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, RichText, Sense, Stroke, StrokeKind,
-    pos2, vec2,
+    Vec2, pos2, vec2,
 };
 use octava_core::{EditCommand, PatternId, Project, Ticks, Track};
 
@@ -13,6 +13,26 @@ use crate::theme;
 const HEADER_WIDTH: f32 = 168.0;
 const RULER_HEIGHT: f32 = 26.0;
 const LANE_HEIGHT: f32 = 58.0;
+const MIN_ZOOM: f32 = 1.0;
+const MAX_ZOOM: f32 = 40.0;
+
+/// Maps ticks to screen x for the current horizontal viewport.
+#[derive(Clone, Copy)]
+struct View {
+    left: f32,
+    left_tick: f64,
+    px_per_tick: f64,
+}
+
+impl View {
+    fn tick_to_x(self, tick: f64) -> f32 {
+        self.left + ((tick - self.left_tick) * self.px_per_tick) as f32
+    }
+
+    fn x_to_tick(self, x: f32) -> f64 {
+        self.left_tick + f64::from(x - self.left) / self.px_per_tick
+    }
+}
 
 pub(crate) fn show(
     ui: &mut egui::Ui,
@@ -36,19 +56,45 @@ pub(crate) fn show(
     let timeline_width = (rect.width() - HEADER_WIDTH).max(1.0);
     let project_bars = (project.length_ticks().0 as f64 / bar_ticks).ceil() as u64;
     let total_bars = project_bars.max(8);
-    let px_per_tick = f64::from(timeline_width) / (total_bars as f64 * bar_ticks);
+    let total_ticks = total_bars as f64 * bar_ticks;
+    let fit_px_per_tick = f64::from(timeline_width) / total_ticks;
+
+    handle_view_input(
+        ui,
+        &response,
+        state,
+        fit_px_per_tick,
+        total_ticks,
+        timeline_left,
+    );
+
+    let px_per_tick = fit_px_per_tick * f64::from(state.timeline.zoom);
     let px_per_bar = px_per_tick * bar_ticks;
+    let visible_ticks = f64::from(timeline_width) / px_per_tick;
+    state.timeline.left_tick = state
+        .timeline
+        .left_tick
+        .clamp(0.0, (total_ticks - visible_ticks).max(0.0));
+    let view = View {
+        left: timeline_left,
+        left_tick: state.timeline.left_tick,
+        px_per_tick,
+    };
 
     let timeline_rect = Rect::from_min_max(pos2(timeline_left, rect.top()), rect.max);
-    let lanes_top = rect.top() + RULER_HEIGHT;
-    let max_lanes = ((rect.height() - RULER_HEIGHT) / LANE_HEIGHT).floor() as usize;
-    let visible_tracks = project.tracks.len().min(max_lanes);
+    let lane_viewport = (rect.height() - RULER_HEIGHT).max(0.0);
+    let max_scroll_y = (project.tracks.len() as f32 * LANE_HEIGHT - lane_viewport).max(0.0);
+    state.timeline.scroll_y = state.timeline.scroll_y.clamp(0.0, max_scroll_y);
+    let lanes_top = rect.top() + RULER_HEIGHT - state.timeline.scroll_y;
+    let first_lane = (state.timeline.scroll_y / LANE_HEIGHT).floor() as usize;
+    let last_lane = (((state.timeline.scroll_y + lane_viewport) / LANE_HEIGHT).ceil() as usize)
+        .min(project.tracks.len());
 
     handle_shortcuts(ui, project, playback, state, actions);
 
     if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
         update_clip_drag(project, state, px_per_tick, pointer.x);
-        update_track_drag(project, state, pointer.y, lanes_top, visible_tracks);
+        update_track_drag(project, state, pointer.y, lanes_top, project.tracks.len());
     }
 
     let painter = ui.painter_at(rect);
@@ -63,11 +109,12 @@ pub(crate) fn show(
     } else {
         (52.0 / px_per_bar).ceil() as u64
     };
-    let mut bar = 0;
-    while bar <= total_bars {
-        let x = timeline_left + (bar as f64 * bar_ticks * px_per_tick) as f32;
+    let mut bar = (view.left_tick / bar_ticks).floor().max(0.0) as u64;
+    let last_bar = ((view.left_tick + visible_ticks) / bar_ticks).ceil() as u64 + 1;
+    while bar <= last_bar.min(total_bars + 1) {
+        let x = view.tick_to_x(bar as f64 * bar_ticks);
         if x >= timeline_left - 1.0 && x <= rect.right() {
-            if bar % bar_step == 0 {
+            if bar.is_multiple_of(bar_step) {
                 painter.text(
                     pos2(x + 5.0, rect.top() + 5.0),
                     Align2::LEFT_TOP,
@@ -76,7 +123,7 @@ pub(crate) fn show(
                     theme::TEXT_DIM,
                 );
             }
-            let line_color = if bar % u64::from(project.time_signature.numerator) == 0 {
+            let line_color = if bar.is_multiple_of(u64::from(project.time_signature.numerator)) {
                 theme::GRID_BAR
             } else {
                 theme::GRID_LINE
@@ -99,15 +146,19 @@ pub(crate) fn show(
         );
     }
 
-    for (index, track) in project.tracks.iter().take(visible_tracks).enumerate() {
+    let lanes_clip = Rect::from_min_max(pos2(rect.left(), rect.top() + RULER_HEIGHT), rect.max);
+
+    for index in first_lane..last_lane {
+        let track = &project.tracks[index];
         let lane_top = lanes_top + index as f32 * LANE_HEIGHT;
         let lane_bottom = (lane_top + LANE_HEIGHT).min(rect.bottom());
         let header_rect = Rect::from_min_max(
             pos2(rect.left(), lane_top),
             pos2(timeline_left, lane_bottom),
         );
+        let lane_painter = ui.painter_at(lanes_clip);
         let header_response = ui.interact(
-            header_rect,
+            header_rect.intersect(lanes_clip),
             ui.id().with(("timeline-track", track.id.0)),
             Sense::click_and_drag(),
         );
@@ -200,12 +251,12 @@ pub(crate) fn show(
         } else {
             theme::BACKGROUND
         };
-        painter.rect_filled(
+        lane_painter.rect_filled(
             Rect::from_min_max(header_rect.min, pos2(timeline_left, lane_bottom)),
             CornerRadius::ZERO,
             row_fill,
         );
-        painter.rect_filled(
+        lane_painter.rect_filled(
             Rect::from_min_max(
                 pos2(rect.left(), lane_top),
                 pos2(rect.left() + 3.0, lane_bottom),
@@ -213,7 +264,7 @@ pub(crate) fn show(
             CornerRadius::ZERO,
             color,
         );
-        painter.line_segment(
+        lane_painter.line_segment(
             [
                 pos2(rect.left(), lane_bottom),
                 pos2(rect.right(), lane_bottom),
@@ -221,7 +272,7 @@ pub(crate) fn show(
             Stroke::new(1.0, theme::GRID_LINE),
         );
         if drop_target {
-            painter.rect_stroke(
+            lane_painter.rect_stroke(
                 Rect::from_min_max(header_rect.min, pos2(header_rect.right(), lane_bottom)),
                 CornerRadius::ZERO,
                 Stroke::new(2.0, theme::ACCENT),
@@ -229,37 +280,24 @@ pub(crate) fn show(
             );
         }
 
-        draw_track_header(ui, project, track, header_rect, selected);
+        draw_track_header(ui, project, track, header_rect, lanes_clip, selected);
         draw_track_clips(
             ui,
             project,
             track,
             state,
             actions,
-            timeline_left,
-            px_per_tick,
+            view,
             lane_top,
             lane_bottom,
-        );
-    }
-
-    if project.tracks.len() > visible_tracks {
-        painter.text(
-            pos2(rect.left() + 10.0, rect.bottom() - 6.0),
-            Align2::LEFT_BOTTOM,
-            format!(
-                "+{} more tracks (resize the panel to show them)",
-                project.tracks.len() - visible_tracks
-            ),
-            FontId::proportional(9.5),
-            theme::TEXT_FAINT,
+            lanes_clip,
         );
     }
 
     let empty_header_rect = Rect::from_min_max(
         pos2(
             rect.left(),
-            rect.top() + RULER_HEIGHT + visible_tracks as f32 * LANE_HEIGHT,
+            (lanes_top + project.tracks.len() as f32 * LANE_HEIGHT).min(rect.bottom()),
         ),
         pos2(timeline_left, rect.bottom()),
     );
@@ -312,7 +350,7 @@ pub(crate) fn show(
         Stroke::new(1.0, theme::GRID_BAR),
     );
 
-    let playhead_x = timeline_left + (playback.playhead.0 as f64 * px_per_tick) as f32;
+    let playhead_x = view.tick_to_x(playback.playhead.0 as f64);
     if playhead_x >= timeline_left && playhead_x <= rect.right() {
         painter.line_segment(
             [
@@ -336,7 +374,7 @@ pub(crate) fn show(
         && pointer.y < rect.top() + RULER_HEIGHT
         && pointer.x >= timeline_left
     {
-        let tick = ((pointer.x - timeline_left) as f64 / px_per_tick).max(0.0);
+        let tick = view.x_to_tick(pointer.x).max(0.0);
         actions.push(UiAction::Seek(Ticks(
             state.snap.snap_tick(tick, project.tempo_map.ppq()),
         )));
@@ -344,21 +382,67 @@ pub(crate) fn show(
 
     // Drop target for clips dragged out of the clips library.
     handle_pattern_drop(
-        ui,
-        project,
-        state,
-        actions,
-        &response,
-        rect,
-        timeline_left,
-        lanes_top,
-        visible_tracks,
-        px_per_tick,
+        ui, project, state, actions, &response, rect, view, lanes_top,
     );
 
     if ui.input(|input| input.pointer.any_released()) {
         finish_clip_drag(state, actions);
         finish_track_drag(state, actions);
+    }
+}
+
+fn handle_view_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    state: &mut UiState,
+    fit_px_per_tick: f64,
+    total_ticks: f64,
+    timeline_left: f32,
+) {
+    if !response.hovered() {
+        return;
+    }
+
+    let (scroll, zoom, shift, pointer) = ui.input(|input| {
+        (
+            input.smooth_scroll_delta,
+            input.zoom_delta(),
+            input.modifiers.shift,
+            input.pointer.hover_pos(),
+        )
+    });
+
+    let old_px_per_tick = fit_px_per_tick * f64::from(state.timeline.zoom);
+
+    if (zoom - 1.0).abs() > f32::EPSILON {
+        let new_zoom = (state.timeline.zoom * zoom).clamp(MIN_ZOOM, MAX_ZOOM);
+        let new_px_per_tick = fit_px_per_tick * f64::from(new_zoom);
+        if let Some(pointer) = pointer.filter(|pointer| pointer.x >= timeline_left) {
+            let anchor =
+                state.timeline.left_tick + f64::from(pointer.x - timeline_left) / old_px_per_tick;
+            state.timeline.left_tick =
+                anchor - f64::from(pointer.x - timeline_left) / new_px_per_tick;
+        }
+        state.timeline.zoom = new_zoom;
+        return;
+    }
+
+    if scroll == Vec2::ZERO {
+        return;
+    }
+
+    if shift {
+        // Shift+wheel scrolls through the track lanes.
+        let dy = if scroll.y != 0.0 { scroll.y } else { scroll.x };
+        state.timeline.scroll_y -= dy;
+    } else {
+        // The plain wheel pans the arrangement sideways.
+        let dx = if scroll.y != 0.0 { scroll.y } else { scroll.x };
+        state.timeline.left_tick -= f64::from(dx) / old_px_per_tick;
+        let visible_ticks =
+            f64::from((response.rect.width() - HEADER_WIDTH).max(1.0)) / old_px_per_tick;
+        let max_left = (total_ticks - visible_ticks).max(0.0);
+        state.timeline.left_tick = state.timeline.left_tick.clamp(0.0, max_left);
     }
 }
 
@@ -453,10 +537,8 @@ fn handle_pattern_drop(
     actions: &mut Vec<UiAction>,
     response: &egui::Response,
     rect: Rect,
-    timeline_left: f32,
+    view: View,
     lanes_top: f32,
-    visible_tracks: usize,
-    px_per_tick: f64,
 ) {
     // `dnd_release_payload` consumes the payload, so it may only be read once;
     // `dnd_hover_payload` is the non-destructive variant used for the ghost.
@@ -471,23 +553,23 @@ fn handle_pattern_drop(
     let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) else {
         return;
     };
-    if pointer.x < timeline_left || pointer.y < lanes_top {
+    if pointer.x < view.left || pointer.y < rect.top() + RULER_HEIGHT {
         return;
     }
 
     let lane = ((pointer.y - lanes_top) / LANE_HEIGHT).floor();
-    if lane < 0.0 || lane as usize >= visible_tracks {
+    if lane < 0.0 || lane as usize >= project.tracks.len() {
         return;
     }
     let Some(track) = project.tracks.get(lane as usize) else {
         return;
     };
-    let tick = ((pointer.x - timeline_left) as f64 / px_per_tick).max(0.0);
+    let tick = view.x_to_tick(pointer.x).max(0.0);
     let start = Ticks(state.snap.snap_tick(tick, project.tempo_map.ppq()));
 
     // Ghost preview of the clip that would be created.
-    let x0 = timeline_left + (start.0 as f64 * px_per_tick) as f32;
-    let x1 = timeline_left + ((start.0 + pattern.length.0) as f64 * px_per_tick) as f32;
+    let x0 = view.tick_to_x(start.0 as f64);
+    let x1 = view.tick_to_x((start.0 + pattern.length.0) as f64);
     let lane_top = lanes_top + lane * LANE_HEIGHT;
     let ghost = Rect::from_min_max(
         pos2(x0, lane_top + 7.0),
@@ -526,18 +608,18 @@ fn update_track_drag(
     state: &mut UiState,
     pointer_y: f32,
     lanes_top: f32,
-    visible_tracks: usize,
+    track_count: usize,
 ) {
     let Some(drag) = state.track_drag else {
         return;
     };
-    if project.track(drag.track).is_none() || visible_tracks == 0 {
+    if project.track(drag.track).is_none() || track_count == 0 {
         state.track_drag = None;
         return;
     }
 
     let lane = ((pointer_y - lanes_top) / LANE_HEIGHT).floor();
-    let target = lane.clamp(0.0, (visible_tracks - 1) as f32) as usize;
+    let target = lane.clamp(0.0, (track_count - 1) as f32) as usize;
     state.track_drag = Some(TrackDrag {
         target_index: target,
         ..drag
@@ -625,8 +707,15 @@ fn finish_clip_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
     }
 }
 
-fn draw_track_header(ui: &egui::Ui, project: &Project, track: &Track, rect: Rect, selected: bool) {
-    let painter = ui.painter_at(rect);
+fn draw_track_header(
+    ui: &egui::Ui,
+    project: &Project,
+    track: &Track,
+    rect: Rect,
+    clip: Rect,
+    selected: bool,
+) {
+    let painter = ui.painter_at(rect.intersect(clip));
     painter.text(
         pos2(rect.left() + 12.0, rect.top() + 9.0),
         Align2::LEFT_TOP,
@@ -685,15 +774,14 @@ fn draw_track_clips(
     track: &Track,
     state: &mut UiState,
     actions: &mut Vec<UiAction>,
-    timeline_left: f32,
-    px_per_tick: f64,
+    view: View,
     lane_top: f32,
     lane_bottom: f32,
+    area: Rect,
 ) {
-    let clip_painter = ui.painter_at(Rect::from_min_max(
-        pos2(timeline_left, lane_top),
-        pos2(ui.max_rect().right(), lane_bottom),
-    ));
+    let right_edge = ui.max_rect().right();
+    let lane_rect = Rect::from_min_max(pos2(view.left, lane_top), pos2(right_edge, lane_bottom));
+    let clip_painter = ui.painter_at(lane_rect.intersect(area));
 
     for clip in &track.clips {
         let Some(pattern) = project.pattern(clip.pattern) else {
@@ -705,18 +793,21 @@ fn draw_track_clips(
             .filter(|drag| drag.track == track.id && drag.clip == clip.id);
         let display_start = dragging.map_or(clip.start.0, |drag| drag.preview_start.0);
         let display_length = dragging.map_or(clip.length.0, |drag| drag.preview_length.0);
-        let x0 = timeline_left + (display_start as f64 * px_per_tick) as f32;
-        let x1 = timeline_left + ((display_start + display_length) as f64 * px_per_tick) as f32;
+        let x0 = view.tick_to_x(display_start as f64);
+        let x1 = view.tick_to_x((display_start + display_length) as f64);
+        if x1 < view.left || x0 > right_edge {
+            continue;
+        }
         let clip_rect = Rect::from_min_max(
-            pos2(x0.max(timeline_left), lane_top + 7.0),
+            pos2(x0.max(view.left), lane_top + 7.0),
             pos2(x1.max(x0 + 2.0), lane_bottom - 7.0),
         );
-        if clip_rect.right() < timeline_left {
+        if clip_rect.right() < view.left {
             continue;
         }
 
         let response = ui.interact(
-            clip_rect,
+            clip_rect.intersect(area),
             ui.id().with(("timeline-clip", clip.id.0)),
             Sense::click_and_drag(),
         );

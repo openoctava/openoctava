@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use fluidlite::{FontId, Settings, Synth};
+use fluidlite::{FontId, IsSettings as _, Settings, Synth};
 use octava_core::{PlaybackSnapshot, Preset, Ticks};
 use rtrb::{Consumer, Producer, RingBuffer};
 use thiserror::Error;
@@ -268,12 +268,18 @@ impl AudioEngine {
 
 pub(crate) fn create_synth(path: &Path, sample_rate: u32) -> Result<(Synth, FontId), AudioError> {
     let settings = Settings::new().map_err(|error| AudioError::Synth(error.to_string()))?;
+    // FluidLite mixes the chorus into both output channels, which drowns the
+    // per-voice pan and makes the mixer's balance control inaudible.
+    if let Some(chorus) = settings.str_("synth.chorus.active") {
+        chorus.set("no");
+    }
     let synth = Synth::new(settings).map_err(|error| AudioError::Synth(error.to_string()))?;
     synth.set_sample_rate(sample_rate as f32);
     let _ = synth.set_polyphony(128);
     synth.set_gain(0.75);
+    let prepared = soundfont::prepare(path);
     let font_id = synth
-        .sfload(path, true)
+        .sfload(&prepared, true)
         .map_err(|source| AudioError::SoundFont {
             path: path.display().to_string(),
             source,

@@ -202,6 +202,14 @@ pub(crate) struct TrackDrag {
     pub target_index: usize,
 }
 
+/// In-progress tempo edit, applied once the drag ends so that dragging the
+/// BPM field does not flood the undo history with intermediate values.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TempoDrag {
+    pub tick: Ticks,
+    pub bpm: f64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PianoRollState {
     pub px_per_beat: f32,
@@ -221,6 +229,25 @@ impl Default for PianoRollState {
     }
 }
 
+/// Viewport of the track timeline: a zoom factor over the fit-to-width scale,
+/// the first visible tick and the vertical lane offset.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TimelineState {
+    pub zoom: f32,
+    pub left_tick: f64,
+    pub scroll_y: f32,
+}
+
+impl Default for TimelineState {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            left_tick: 0.0,
+            scroll_y: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UiState {
     pub selected_track: Option<TrackId>,
@@ -233,6 +260,8 @@ pub(crate) struct UiState {
     pub pending_clip: Option<PendingClip>,
     pub snap: SnapSettings,
     pub piano_roll: PianoRollState,
+    pub timeline: TimelineState,
+    pub tempo_drag: Option<TempoDrag>,
     pub note_drag: Option<NoteDrag>,
     pub clip_drag: Option<ClipDrag>,
     pub track_drag: Option<TrackDrag>,
