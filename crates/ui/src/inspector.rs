@@ -1,7 +1,7 @@
 use egui::RichText;
 use octava_core::{EditCommand, Project};
 
-use crate::state::{UiAction, UiState};
+use crate::state::{ClipRef, UiAction, UiState};
 use crate::theme;
 
 pub(crate) fn show(
@@ -117,7 +117,7 @@ fn track_list(ui: &mut egui::Ui, project: &Project, state: &mut UiState) {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(format!("{} notes", track.note_count()))
+                    RichText::new(format!("{} notes", project.track_note_count(track.id)))
                         .size(9.5)
                         .color(theme::TEXT_FAINT),
                 );
@@ -215,21 +215,56 @@ fn clips_section(ui: &mut egui::Ui, project: &Project, state: &mut UiState) {
         .max(1) as f64;
 
     for clip in &track.clips {
+        let Some(pattern) = project.pattern(clip.pattern) else {
+            continue;
+        };
         let start = clip.start.0 as f64 / bar_ticks + 1.0;
         let end = clip.end().0 as f64 / bar_ticks + 1.0;
-        let selected = state.selected_clip == Some(clip.id);
+        let selection = ClipRef {
+            track: track.id,
+            clip: clip.id,
+        };
+        let selected = state.selected_clip == Some(selection);
         let label = format!(
-            "Clip {}  ·  {} notes  ·  {start:.1}–{end:.1}",
-            clip.id.get(),
-            clip.notes.len()
+            "{}  ·  {} notes  ·  {start:.1}–{end:.1}",
+            pattern.name,
+            pattern.notes.len()
         );
 
         if ui
             .selectable_label(selected, RichText::new(label).size(11.0))
             .clicked()
         {
-            state.select_clip(track.id, clip.id);
+            state.select_clip(project, track.id, clip.id);
         }
+    }
+
+    if let Some(clip) = state.selected_clip(project)
+        && let Some(pattern) = project.pattern(clip.pattern)
+    {
+        ui.add_space(8.0);
+        section(ui, "PATTERN");
+        egui::Grid::new("pattern-details")
+            .num_columns(2)
+            .spacing([16.0, 4.0])
+            .show(ui, |ui| {
+                detail_row(ui, "Name", &pattern.name);
+                detail_row(
+                    ui,
+                    "Instrument",
+                    crate::clips::instrument_name(pattern.preset),
+                );
+                detail_row(
+                    ui,
+                    "Used",
+                    &format!("{}× on the timeline", project.pattern_use_count(pattern.id)),
+                );
+            });
+        ui.label(
+            RichText::new("Editing a pattern updates every clip that plays it.")
+                .size(9.5)
+                .color(theme::TEXT_FAINT),
+        );
     }
 }
 

@@ -1,15 +1,42 @@
 use egui::{
     Align2, CornerRadius, CursorIcon, FontId, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2,
 };
-use octava_core::{EditCommand, Project, Ticks};
+use octava_core::{EditCommand, PatternId, Preset, Project};
 
-use crate::state::{PlaybackView, UiAction, UiState};
+use crate::state::{PatternDragPayload, PlaybackView, UiAction, UiState};
 use crate::theme;
+
+/// A small, deliberately incomplete GM program list used by the per-pattern
+/// instrument chooser. The selection is stored on the pattern but is not routed
+/// to the synthesizer yet: a track owns one MIDI channel and therefore one
+/// program.
+pub(crate) const INSTRUMENTS: [(&str, u8); 12] = [
+    ("Acoustic Piano", 0),
+    ("Electric Piano", 4),
+    ("Drawbar Organ", 16),
+    ("Nylon Guitar", 24),
+    ("Electric Bass", 33),
+    ("Strings", 48),
+    ("Choir", 52),
+    ("Brass", 61),
+    ("Alto Sax", 65),
+    ("Square Lead", 80),
+    ("Warm Pad", 89),
+    ("Marimba", 12),
+];
+
+#[must_use]
+pub(crate) fn instrument_name(preset: Preset) -> &'static str {
+    INSTRUMENTS
+        .iter()
+        .find(|(_, program)| *program == preset.program)
+        .map_or("Program", |(name, _)| name)
+}
 
 pub(crate) fn show(
     ui: &mut egui::Ui,
     project: &Project,
-    playback: &PlaybackView,
+    _playback: &PlaybackView,
     state: &mut UiState,
     actions: &mut Vec<UiAction>,
 ) {
@@ -31,28 +58,30 @@ pub(crate) fn show(
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add_enabled(
-                            state.selected_track.is_some(),
-                            egui::Button::new(RichText::new("+ Clip").size(9.5)),
-                        )
-                        .on_hover_text("Add a 4-bar clip at the playhead")
+                        .add(egui::Button::new(RichText::new("+ Clip").size(9.5)))
+                        .on_hover_text("Create a new 4-bar pattern")
                         .clicked()
-                        && let Some(track) = state.selected_track
                     {
-                        actions.push(UiAction::Edit(EditCommand::AddClip {
-                            track,
-                            start: playback.playhead,
-                            length: Ticks(bar_ticks.saturating_mul(4).max(1)),
+                        let number = project.patterns.len() + 1;
+                        actions.push(UiAction::Edit(EditCommand::AddPattern {
+                            name: format!("Clip {number}"),
+                            length: octava_core::Ticks(bar_ticks.saturating_mul(4).max(1)),
                         }));
                     }
                 });
             });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("Drag a clip into Tracks to place it")
+                    .size(9.0)
+                    .color(theme::TEXT_FAINT),
+            );
             ui.add_space(3.0);
 
-            if project.tracks.is_empty() {
+            if project.patterns.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        RichText::new("No tracks yet")
+                        RichText::new("No clips yet")
                             .size(12.0)
                             .color(theme::TEXT_DIM),
                     );
@@ -63,89 +92,106 @@ pub(crate) fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for (index, track) in project.tracks.iter().enumerate() {
-                        let selected_track = state.selected_track == Some(track.id);
-                        let color = theme::track_color(index);
+                    for (index, pattern) in project.patterns.iter().enumerate() {
+                        let selected = state.selected_pattern == Some(pattern.id);
+                        let color = theme::pattern_color(index);
+                        let response = pattern_card(
+                            ui,
+                            &pattern.name,
+                            pattern.notes.len(),
+                            pattern.length.0,
+                            pattern.preset,
+                            project.pattern_use_count(pattern.id),
+                            bar_ticks,
+                            color,
+                            selected,
+                        );
 
-                        ui.horizontal(|ui| {
-                            let (rect, _) = ui.allocate_exact_size(vec2(7.0, 7.0), Sense::hover());
-                            ui.painter().circle_filled(rect.center(), 3.5, color);
-                            if ui
-                                .selectable_label(
-                                    selected_track,
-                                    RichText::new(&track.name).size(11.5).color(
-                                        if selected_track {
-                                            theme::TEXT
-                                        } else {
-                                            theme::TEXT_DIM
-                                        },
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                state.select_track(project, track.id);
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(track.clips.len().to_string())
-                                            .size(9.0)
-                                            .color(theme::TEXT_FAINT),
-                                    );
-                                },
-                            );
+                        if response.clicked() {
+                            state.select_pattern(pattern.id);
+                        }
+                        if response.double_clicked() {
+                            state.select_pattern(pattern.id);
+                            state.focus_piano_roll = true;
+                        }
+
+                        // Drag a pattern from the library onto the timeline.
+                        if response.drag_started() {
+                            response.ctx.set_cursor_icon(CursorIcon::Grabbing);
+                        }
+                        response.dnd_set_drag_payload(PatternDragPayload {
+                            pattern: pattern.id,
                         });
 
-                        if track.clips.is_empty() {
-                            ui.label(
-                                RichText::new("  No clips")
-                                    .size(10.0)
-                                    .color(theme::TEXT_FAINT),
-                            );
-                        }
+                        response.context_menu(|ui| {
+                            pattern_menu(ui, pattern.id, actions);
+                        });
 
-                        for clip in &track.clips {
-                            let selected = state.selected_clip == Some(clip.id)
-                                && state.selected_track == Some(track.id);
-                            let response = clip_card(
-                                ui,
-                                clip.id.get(),
-                                clip.notes.len(),
-                                clip.start.0,
-                                clip.end().0,
-                                bar_ticks,
-                                color,
-                                selected,
-                            );
-                            if response.clicked() {
-                                state.select_clip(track.id, clip.id);
-                            }
-                            if response.double_clicked() {
-                                state.select_clip(track.id, clip.id);
-                                state.focus_piano_roll = true;
-                            }
-                        }
-
-                        ui.add_space(5.0);
+                        ui.add_space(4.0);
                     }
                 });
         });
 }
 
+fn pattern_menu(ui: &mut egui::Ui, pattern: PatternId, actions: &mut Vec<UiAction>) {
+    if ui
+        .button("Clone")
+        .on_hover_text("Copy this clip into a new, independent clip")
+        .clicked()
+    {
+        actions.push(UiAction::Edit(EditCommand::ClonePattern { pattern }));
+        ui.close();
+    }
+
+    ui.menu_button("Instrument", |ui| {
+        ui.label(
+            RichText::new("Placeholder: not routed to the synth yet")
+                .size(9.0)
+                .color(theme::TEXT_FAINT),
+        );
+        ui.separator();
+        for (name, program) in INSTRUMENTS {
+            if ui
+                .button(name)
+                .on_hover_text(format!("GM program {program}"))
+                .clicked()
+            {
+                actions.push(UiAction::Edit(EditCommand::SetPatternPreset {
+                    pattern,
+                    preset: Preset::new(0, program),
+                }));
+                ui.close();
+            }
+        }
+    });
+
+    ui.separator();
+    if ui
+        .button("Delete")
+        .on_hover_text("Remove this clip and every placement of it")
+        .clicked()
+    {
+        actions.push(UiAction::Edit(EditCommand::RemovePattern { pattern }));
+        ui.close();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn clip_card(
+fn pattern_card(
     ui: &mut egui::Ui,
-    clip_id: u64,
+    name: &str,
     notes: usize,
-    start: u64,
-    end: u64,
+    length: u64,
+    preset: Preset,
+    uses: usize,
     bar_ticks: u64,
     color: egui::Color32,
     selected: bool,
 ) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width().max(80.0), 42.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width().max(80.0), 46.0),
+        Sense::click_and_drag(),
+    );
     let painter = ui.painter();
     let fill = if selected {
         theme::ACCENT_SOFT
@@ -182,28 +228,31 @@ fn clip_card(
         color,
     );
 
-    let bar_start = start as f64 / bar_ticks as f64 + 1.0;
-    let bar_end = end as f64 / bar_ticks as f64 + 1.0;
+    let text_color = if selected {
+        theme::TEXT
+    } else {
+        theme::TEXT_DIM
+    };
     painter.text(
-        pos2(rect.left() + 10.0, rect.top() + 10.0),
+        pos2(rect.left() + 10.0, rect.top() + 12.0),
         Align2::LEFT_CENTER,
-        format!("Clip {clip_id}"),
-        FontId::proportional(11.0),
-        if selected {
-            theme::TEXT
-        } else {
-            theme::TEXT_DIM
-        },
+        name,
+        FontId::proportional(11.5),
+        text_color,
     );
     painter.text(
-        pos2(rect.left() + 10.0, rect.top() + 28.0),
+        pos2(rect.left() + 10.0, rect.top() + 31.0),
         Align2::LEFT_CENTER,
-        format!("{bar_start:.1}–{bar_end:.1}  ·  {notes} notes"),
+        format!(
+            "{}  ·  {:.0} bars  ·  {notes} notes  ·  used {uses}×",
+            instrument_name(preset),
+            length as f64 / bar_ticks as f64
+        ),
         FontId::proportional(9.0),
         theme::TEXT_FAINT,
     );
 
     response
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text("Click to edit · double-click for Piano Roll")
+        .on_hover_cursor(CursorIcon::Grab)
+        .on_hover_text("Click to edit · double-click for Piano Roll · drag into Tracks")
 }

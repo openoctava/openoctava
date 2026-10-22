@@ -1,5 +1,5 @@
 use egui::Pos2;
-use octava_core::{ClipId, EditCommand, NoteId, Project, Ticks, Track, TrackId};
+use octava_core::{ClipId, EditCommand, NoteId, PatternId, Project, Ticks, Track, TrackId};
 
 /// Read-only transport state supplied by the application layer.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -107,11 +107,41 @@ impl SnapSettings {
     }
 }
 
+/// Identifies a clip placement on a track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct NoteRef {
+pub(crate) struct ClipRef {
     pub track: TrackId,
     pub clip: ClipId,
+}
+
+/// A note inside a pattern. Notes are shared by every placement of a pattern,
+/// so the pattern id is part of the reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NoteRef {
+    pub pattern: PatternId,
     pub note: NoteId,
+}
+
+/// Payload dragged from the clips library onto the timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PatternDragPayload {
+    pub pattern: PatternId,
+}
+
+/// Clipboard entry for Ctrl+C / Ctrl+V on the timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClipboardClip {
+    pub pattern: PatternId,
+    pub length: Ticks,
+}
+
+/// A clip placement the UI just asked the app layer to create. Once the
+/// command lands, the next frame selects it so that repeated Ctrl+D chains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingClip {
+    pub track: TrackId,
+    pub pattern: PatternId,
+    pub start: Ticks,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,8 +224,13 @@ impl Default for PianoRollState {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UiState {
     pub selected_track: Option<TrackId>,
-    pub selected_clip: Option<ClipId>,
+    /// Clip placement selected on the timeline.
+    pub selected_clip: Option<ClipRef>,
+    /// Pattern opened in the piano roll / focused in the clips library.
+    pub selected_pattern: Option<PatternId>,
     pub selected_note: Option<NoteRef>,
+    pub clipboard: Option<ClipboardClip>,
+    pub pending_clip: Option<PendingClip>,
     pub snap: SnapSettings,
     pub piano_roll: PianoRollState,
     pub note_drag: Option<NoteDrag>,
@@ -214,27 +249,43 @@ impl UiState {
             self.selected_track = project.tracks.first().map(|track| track.id);
         }
 
-        let clips = self
-            .selected_track
-            .and_then(|id| project.track(id))
-            .map(|track| track.clips.as_slice())
-            .unwrap_or(&[]);
+        let clip_is_valid = self.selected_clip.is_some_and(|selection| {
+            project
+                .track(selection.track)
+                .and_then(|track| track.clip(selection.clip))
+                .is_some()
+        });
+        if !clip_is_valid {
+            self.selected_clip = self.selected_track.and_then(|id| {
+                let track = project.track(id)?;
+                let clip = track.clips.first()?;
+                Some(ClipRef {
+                    track: id,
+                    clip: clip.id,
+                })
+            });
+        }
 
         if self
-            .selected_clip
-            .is_none_or(|id| !clips.iter().any(|clip| clip.id == id))
+            .selected_pattern
+            .is_none_or(|id| project.pattern(id).is_none())
         {
-            self.selected_clip = clips.first().map(|clip| clip.id);
+            self.selected_pattern = self
+                .selected_clip
+                .and_then(|selection| {
+                    project
+                        .track(selection.track)
+                        .and_then(|track| track.clip(selection.clip))
+                        .map(|clip| clip.pattern)
+                })
+                .or_else(|| project.patterns.first().map(|pattern| pattern.id));
         }
 
         let selected_note_is_valid = self.selected_note.is_some_and(|selection| {
-            self.selected_track == Some(selection.track)
-                && self.selected_clip == Some(selection.clip)
-                && project
-                    .track(selection.track)
-                    .and_then(|track| track.clip(selection.clip))
-                    .and_then(|clip| clip.note(selection.note))
-                    .is_some()
+            project
+                .pattern(selection.pattern)
+                .and_then(|pattern| pattern.note(selection.note))
+                .is_some()
         });
         if !selected_note_is_valid {
             self.selected_note = None;
@@ -242,9 +293,8 @@ impl UiState {
 
         let note_drag_is_valid = self.note_drag.is_some_and(|drag| {
             project
-                .track(drag.note.track)
-                .and_then(|track| track.clip(drag.note.clip))
-                .and_then(|clip| clip.note(drag.note.note))
+                .pattern(drag.note.pattern)
+                .and_then(|pattern| pattern.note(drag.note.note))
                 .is_some()
         });
         if !note_drag_is_valid {
@@ -276,6 +326,19 @@ impl UiState {
         {
             self.mixer_drag = None;
         }
+
+        // A clip created by Duplicate/Paste becomes the selection so that the
+        // next Ctrl+D continues from its end.
+        if let Some(pending) = self.pending_clip.take()
+            && let Some(clip) = project.track(pending.track).and_then(|track| {
+                track
+                    .clips
+                    .iter()
+                    .find(|clip| clip.pattern == pending.pattern && clip.start == pending.start)
+            })
+        {
+            self.select_clip(project, pending.track, clip.id);
+        }
     }
 
     pub fn select_track(&mut self, project: &Project, id: TrackId) {
@@ -283,19 +346,52 @@ impl UiState {
         self.selected_clip = project
             .track(id)
             .and_then(|track| track.clips.first())
-            .map(|clip| clip.id);
+            .map(|clip| ClipRef {
+                track: id,
+                clip: clip.id,
+            });
+        if let Some(selection) = self.selected_clip
+            && let Some(pattern) = project
+                .track(selection.track)
+                .and_then(|track| track.clip(selection.clip))
+                .map(|clip| clip.pattern)
+        {
+            self.selected_pattern = Some(pattern);
+        }
         self.selected_note = None;
     }
 
-    pub fn select_clip(&mut self, track: TrackId, clip: ClipId) {
-        if self.selected_track != Some(track) || self.selected_clip != Some(clip) {
+    pub fn select_clip(&mut self, project: &Project, track: TrackId, clip: ClipId) {
+        let selection = ClipRef { track, clip };
+        if self.selected_clip != Some(selection) {
             self.selected_note = None;
         }
         self.selected_track = Some(track);
-        self.selected_clip = Some(clip);
+        self.selected_clip = Some(selection);
+        if let Some(pattern) = project
+            .track(track)
+            .and_then(|track| track.clip(clip))
+            .map(|clip| clip.pattern)
+        {
+            self.selected_pattern = Some(pattern);
+        }
+    }
+
+    /// Selects a pattern in the clips library. Playback is unaffected: a
+    /// pattern only sounds where it has been placed on a track.
+    pub fn select_pattern(&mut self, pattern: PatternId) {
+        if self.selected_pattern != Some(pattern) {
+            self.selected_note = None;
+        }
+        self.selected_pattern = Some(pattern);
     }
 
     pub fn selected_track<'a>(&self, project: &'a Project) -> Option<&'a Track> {
         self.selected_track.and_then(|id| project.track(id))
+    }
+
+    pub fn selected_clip<'a>(&self, project: &'a Project) -> Option<&'a octava_core::Clip> {
+        let selection = self.selected_clip?;
+        project.track(selection.track)?.clip(selection.clip)
     }
 }

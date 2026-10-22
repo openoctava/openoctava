@@ -16,7 +16,7 @@ use egui::{
     WidgetText, vec2,
 };
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
-use octava_core::{EditCommand, Project, Ticks};
+use octava_core::{EditCommand, Project};
 
 use state::UiState;
 pub use state::{PlaybackView, UiAction};
@@ -153,10 +153,8 @@ impl OctavaUi {
         let mut reset_layout = false;
         let mut focus_tab = None;
         let selected_track = self.state.selected_track;
+        let selected_pattern = self.state.selected_pattern;
         let selected_note = self.state.selected_note;
-        let bar_ticks = project
-            .time_signature
-            .ticks_per_bar(project.tempo_map.ppq());
 
         egui::Panel::top("octava-titlebar")
             .exact_size(TITLEBAR_HEIGHT)
@@ -229,16 +227,17 @@ impl OctavaUi {
                         }
                         if ui
                             .add_enabled(
-                                selected_track.is_some(),
+                                selected_track.is_some() && selected_pattern.is_some(),
                                 egui::Button::new("Add Clip at Playhead"),
                             )
+                            .on_hover_text("Place the selected clip from the Clips panel")
                             .clicked()
-                            && let Some(track) = selected_track
+                            && let (Some(track), Some(pattern)) = (selected_track, selected_pattern)
                         {
                             actions.push(UiAction::Edit(EditCommand::AddClip {
                                 track,
+                                pattern,
                                 start: playback.playhead,
-                                length: Ticks(bar_ticks.saturating_mul(4).max(1)),
                             }));
                             ui.close();
                         }
@@ -251,8 +250,7 @@ impl OctavaUi {
                             && let Some(selection) = selected_note
                         {
                             actions.push(UiAction::Edit(EditCommand::RemoveNotes {
-                                track: selection.track,
-                                clip: selection.clip,
+                                pattern: selection.pattern,
                                 notes: vec![selection.note],
                             }));
                             ui.close();

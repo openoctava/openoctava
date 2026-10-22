@@ -31,6 +31,13 @@ pub fn track_color(index: usize) -> Color32 {
     TRACK_COLORS[index % TRACK_COLORS.len()]
 }
 
+/// Colour of a clip, derived from the pattern it plays so that every
+/// placement of the same pattern looks the same.
+#[must_use]
+pub fn pattern_color(index: usize) -> Color32 {
+    TRACK_COLORS[(index + 1) % TRACK_COLORS.len()]
+}
+
 pub fn install(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = PANEL;

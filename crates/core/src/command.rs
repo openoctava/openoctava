@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    ClipId, ModelError, NoteId, Preset, Project, TrackId, validate_note_geometry, validate_preset,
-    validate_velocity,
+    ClipId, ModelError, NoteId, PatternId, Preset, Project, TrackId, validate_note_geometry,
+    validate_preset, validate_velocity,
 };
 use crate::time::{Ticks, TimeSignature};
 
@@ -33,10 +33,28 @@ pub enum EditCommand {
         solo: Option<bool>,
         preset: Option<Preset>,
     },
+    /// Creates an empty reusable pattern in the clips library.
+    AddPattern {
+        name: String,
+        length: Ticks,
+    },
+    /// Copies a pattern and all of its notes under a new id.
+    ClonePattern {
+        pattern: PatternId,
+    },
+    /// Removes a pattern together with every clip that plays it.
+    RemovePattern {
+        pattern: PatternId,
+    },
+    SetPatternPreset {
+        pattern: PatternId,
+        preset: Preset,
+    },
+    /// Places a pattern on a track's timeline.
     AddClip {
         track: TrackId,
+        pattern: PatternId,
         start: Ticks,
-        length: Ticks,
     },
     RemoveClip {
         track: TrackId,
@@ -53,35 +71,30 @@ pub enum EditCommand {
         length: Ticks,
     },
     AddNote {
-        track: TrackId,
-        clip: ClipId,
+        pattern: PatternId,
         key: u8,
         velocity: u8,
         start: Ticks,
         length: Ticks,
     },
     RemoveNotes {
-        track: TrackId,
-        clip: ClipId,
+        pattern: PatternId,
         notes: Vec<NoteId>,
     },
     MoveNotes {
-        track: TrackId,
-        clip: ClipId,
+        pattern: PatternId,
         notes: Vec<NoteId>,
         delta_ticks: i64,
         delta_key: i32,
     },
     ResizeNote {
-        track: TrackId,
-        clip: ClipId,
+        pattern: PatternId,
         note: NoteId,
         start: Ticks,
         length: Ticks,
     },
     SetNoteVelocity {
-        track: TrackId,
-        clip: ClipId,
+        pattern: PatternId,
         note: NoteId,
         velocity: u8,
     },
@@ -98,6 +111,7 @@ pub enum EditCommand {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EditOutcome {
     pub track: Option<TrackId>,
+    pub pattern: Option<PatternId>,
     pub clip: Option<ClipId>,
     pub note: Option<NoteId>,
     pub removed_notes: usize,
@@ -184,13 +198,41 @@ pub(crate) fn apply(
             }
             outcome.track = Some(*track);
         }
+        EditCommand::AddPattern { name, length } => {
+            validate_pattern_name(name)?;
+            let pattern = project.add_pattern(name.trim(), *length)?;
+            outcome.pattern = Some(pattern);
+        }
+        EditCommand::ClonePattern { pattern } => {
+            let clone = project.clone_pattern(*pattern)?;
+            outcome.pattern = Some(clone);
+        }
+        EditCommand::RemovePattern { pattern } => {
+            let index = project
+                .pattern_index(*pattern)
+                .ok_or(ModelError::PatternNotFound(*pattern))?;
+            project.patterns.remove(index);
+            for track in &mut project.tracks {
+                track.clips.retain(|clip| clip.pattern != *pattern);
+            }
+            outcome.pattern = Some(*pattern);
+        }
+        EditCommand::SetPatternPreset { pattern, preset } => {
+            validate_preset(*preset)?;
+            let stored = project
+                .pattern_mut(*pattern)
+                .ok_or(ModelError::PatternNotFound(*pattern))?;
+            stored.preset = *preset;
+            outcome.pattern = Some(*pattern);
+        }
         EditCommand::AddClip {
             track,
+            pattern,
             start,
-            length,
         } => {
-            let clip = project.add_clip(*track, *start, *length)?;
+            let clip = project.add_clip(*track, *pattern, *start)?;
             outcome.clip = Some(clip);
+            outcome.pattern = Some(*pattern);
         }
         EditCommand::RemoveClip { track, clip } => {
             let (track_index, clip_index) = locate_clip(project, *track, *clip)?;
@@ -215,19 +257,21 @@ pub(crate) fn apply(
             outcome.clip = Some(*clip);
         }
         EditCommand::AddNote {
-            track,
-            clip,
+            pattern,
             key,
             velocity,
             start,
             length,
         } => {
-            let note = project.add_note(*track, *clip, *key, *velocity, *start, *length)?;
+            let note = project.add_note(*pattern, *key, *velocity, *start, *length)?;
             outcome.note = Some(note);
+            outcome.pattern = Some(*pattern);
         }
-        EditCommand::RemoveNotes { track, clip, notes } => {
-            let (track_index, clip_index) = locate_clip(project, *track, *clip)?;
-            let stored = &project.tracks[track_index].clips[clip_index];
+        EditCommand::RemoveNotes { pattern, notes } => {
+            let index = project
+                .pattern_index(*pattern)
+                .ok_or(ModelError::PatternNotFound(*pattern))?;
+            let stored = &project.patterns[index];
             let unique: HashSet<NoteId> = notes.iter().copied().collect();
             for note in &unique {
                 if stored.note(*note).is_none() {
@@ -239,32 +283,33 @@ pub(crate) fn apply(
             }
 
             let before = stored.notes.len();
-            project.tracks[track_index].clips[clip_index]
+            project.patterns[index]
                 .notes
                 .retain(|note| !unique.contains(&note.id));
-            outcome.removed_notes =
-                before - project.tracks[track_index].clips[clip_index].notes.len();
+            outcome.removed_notes = before - project.patterns[index].notes.len();
+            outcome.pattern = Some(*pattern);
         }
         EditCommand::MoveNotes {
-            track,
-            clip,
+            pattern,
             notes,
             delta_ticks,
             delta_key,
         } => {
-            let (track_index, clip_index) = locate_clip(project, *track, *clip)?;
-            let stored = &project.tracks[track_index].clips[clip_index];
+            let index = project
+                .pattern_index(*pattern)
+                .ok_or(ModelError::PatternNotFound(*pattern))?;
+            let stored = &project.patterns[index];
             let indices = unique_note_indices(stored, notes)?;
             if indices.is_empty() {
                 return Ok(outcome);
             }
 
-            for index in &indices {
-                let note = &stored.notes[*index];
+            for note_index in &indices {
+                let note = &stored.notes[*note_index];
                 let new_start = note.start.0 as i128 + i128::from(*delta_ticks);
                 let new_key = i128::from(note.key) + i128::from(*delta_key);
                 if new_start < 0 || new_start > u64::MAX as i128 {
-                    return Err(ModelError::NoteOutsideClip);
+                    return Err(ModelError::NoteOutsidePattern);
                 }
                 if !(0..=127).contains(&new_key) {
                     return Err(ModelError::InvalidKey(new_key as i32));
@@ -272,46 +317,51 @@ pub(crate) fn apply(
                 validate_note_geometry(Ticks(new_start as u64), note.length, stored.length)?;
             }
 
-            let stored = &mut project.tracks[track_index].clips[clip_index];
-            for index in indices {
-                let note = &mut stored.notes[index];
+            let stored = &mut project.patterns[index];
+            for note_index in indices {
+                let note = &mut stored.notes[note_index];
                 note.start = Ticks((note.start.0 as i128 + i128::from(*delta_ticks)) as u64);
                 note.key = (i128::from(note.key) + i128::from(*delta_key)) as u8;
             }
+            outcome.pattern = Some(*pattern);
         }
         EditCommand::ResizeNote {
-            track,
-            clip,
+            pattern,
             note,
             start,
             length,
         } => {
-            let (track_index, clip_index) = locate_clip(project, *track, *clip)?;
-            let stored = &project.tracks[track_index].clips[clip_index];
+            let index = project
+                .pattern_index(*pattern)
+                .ok_or(ModelError::PatternNotFound(*pattern))?;
+            let stored = &project.patterns[index];
             let note_index = stored
                 .note_index(*note)
                 .ok_or(ModelError::NoteNotFound(*note))?;
             validate_note_geometry(*start, *length, stored.length)?;
 
-            let stored = &mut project.tracks[track_index].clips[clip_index];
+            let stored = &mut project.patterns[index];
             stored.notes[note_index].start = *start;
             stored.notes[note_index].length = *length;
             outcome.note = Some(*note);
+            outcome.pattern = Some(*pattern);
         }
         EditCommand::SetNoteVelocity {
-            track,
-            clip,
+            pattern,
             note,
             velocity,
         } => {
             validate_velocity(*velocity)?;
-            let (track_index, clip_index) = locate_clip(project, *track, *clip)?;
-            let stored = &mut project.tracks[track_index].clips[clip_index];
+            let index = project
+                .pattern_index(*pattern)
+                .ok_or(ModelError::PatternNotFound(*pattern))?;
+            let stored = &mut project.patterns[index];
             let note_index = stored
                 .note_index(*note)
                 .ok_or(ModelError::NoteNotFound(*note))?;
             stored.notes[note_index].velocity = *velocity;
             outcome.note = Some(*note);
+            outcome.pattern = Some(*pattern);
         }
         EditCommand::SetTempo { tick, bpm } => {
             project.tempo_map.insert_tempo(*tick, *bpm)?;
@@ -335,6 +385,14 @@ fn validate_track_name(name: &str) -> Result<(), ModelError> {
     }
 }
 
+fn validate_pattern_name(name: &str) -> Result<(), ModelError> {
+    if name.trim().is_empty() {
+        Err(ModelError::EmptyPatternName)
+    } else {
+        Ok(())
+    }
+}
+
 fn locate_clip(
     project: &Project,
     track: TrackId,
@@ -350,13 +408,13 @@ fn locate_clip(
 }
 
 fn unique_note_indices(
-    clip: &crate::model::MidiClip,
+    pattern: &crate::model::Pattern,
     notes: &[NoteId],
 ) -> Result<Vec<usize>, ModelError> {
     let unique: HashSet<NoteId> = notes.iter().copied().collect();
     let mut indices = Vec::with_capacity(unique.len());
     for note in unique {
-        let index = clip
+        let index = pattern
             .note_index(note)
             .ok_or(ModelError::NoteNotFound(note))?;
         indices.push(index);
@@ -371,16 +429,17 @@ mod tests {
     use crate::model::{Note, Project};
     use crate::store::ProjectStore;
 
-    fn fixture() -> (ProjectStore, TrackId, ClipId) {
+    fn fixture() -> (ProjectStore, TrackId, PatternId, ClipId) {
         let mut project = Project::new("Test");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(3840)).unwrap();
-        (ProjectStore::new(project), track, clip)
+        let pattern = project.add_pattern("Verse", Ticks(3840)).unwrap();
+        let clip = project.add_clip(track, pattern, Ticks::ZERO).unwrap();
+        (ProjectStore::new(project), track, pattern, clip)
     }
 
     #[test]
     fn gain_is_capped_at_unity() {
-        let (mut store, track, _clip) = fixture();
+        let (mut store, track, _pattern, _clip) = fixture();
 
         assert!(
             store
@@ -411,11 +470,10 @@ mod tests {
 
     #[test]
     fn out_of_range_key_reports_the_requested_value() {
-        let (mut store, track, clip) = fixture();
+        let (mut store, _track, pattern, _clip) = fixture();
         let note = store
             .apply(EditCommand::AddNote {
-                track,
-                clip,
+                pattern,
                 key: 60,
                 velocity: 100,
                 start: Ticks(0),
@@ -427,8 +485,7 @@ mod tests {
 
         let error = store
             .apply(EditCommand::MoveNotes {
-                track,
-                clip,
+                pattern,
                 notes: vec![note],
                 delta_ticks: 0,
                 delta_key: -120,
@@ -441,7 +498,7 @@ mod tests {
 
     #[test]
     fn resize_clip_validates_length_and_supports_undo() {
-        let (mut store, track, clip) = fixture();
+        let (mut store, track, _pattern, clip) = fixture();
 
         store
             .apply(EditCommand::ResizeClip {
@@ -523,11 +580,10 @@ mod tests {
 
     #[test]
     fn add_note_returns_allocated_id() {
-        let (mut store, track, clip) = fixture();
+        let (mut store, _track, pattern, _clip) = fixture();
         let outcome = store
             .apply(EditCommand::AddNote {
-                track,
-                clip,
+                pattern,
                 key: 60,
                 velocity: 100,
                 start: Ticks(120),
@@ -536,17 +592,17 @@ mod tests {
             .unwrap();
 
         let note = outcome.note.unwrap();
-        let stored = store.project().track(track).unwrap().clip(clip).unwrap();
+        assert_eq!(outcome.pattern, Some(pattern));
+        let stored = store.project().pattern(pattern).unwrap();
         assert!(stored.note(note).is_some());
     }
 
     #[test]
     fn move_notes_updates_all_targets_atomically() {
-        let (mut store, track, clip) = fixture();
+        let (mut store, _track, pattern, _clip) = fixture();
         let first = store
             .apply(EditCommand::AddNote {
-                track,
-                clip,
+                pattern,
                 key: 60,
                 velocity: 100,
                 start: Ticks(0),
@@ -557,8 +613,7 @@ mod tests {
             .unwrap();
         let second = store
             .apply(EditCommand::AddNote {
-                track,
-                clip,
+                pattern,
                 key: 64,
                 velocity: 100,
                 start: Ticks(960),
@@ -570,15 +625,14 @@ mod tests {
 
         store
             .apply(EditCommand::MoveNotes {
-                track,
-                clip,
+                pattern,
                 notes: vec![first, second],
                 delta_ticks: 240,
                 delta_key: 2,
             })
             .unwrap();
 
-        let stored = store.project().track(track).unwrap().clip(clip).unwrap();
+        let stored = store.project().pattern(pattern).unwrap();
         assert_eq!(stored.note(first).unwrap().start, Ticks(240));
         assert_eq!(stored.note(first).unwrap().key, 62);
         assert_eq!(stored.note(second).unwrap().start, Ticks(1200));
@@ -587,11 +641,10 @@ mod tests {
 
     #[test]
     fn failed_multi_note_move_leaves_notes_untouched() {
-        let (mut store, track, clip) = fixture();
+        let (mut store, _track, pattern, _clip) = fixture();
         let first = store
             .apply(EditCommand::AddNote {
-                track,
-                clip,
+                pattern,
                 key: 60,
                 velocity: 100,
                 start: Ticks(0),
@@ -602,8 +655,7 @@ mod tests {
             .unwrap();
         let second = store
             .apply(EditCommand::AddNote {
-                track,
-                clip,
+                pattern,
                 key: 64,
                 velocity: 100,
                 start: Ticks(960),
@@ -615,8 +667,7 @@ mod tests {
         let revision = store.revision();
 
         let result = store.apply(EditCommand::MoveNotes {
-            track,
-            clip,
+            pattern,
             notes: vec![first, second],
             delta_ticks: 0,
             delta_key: -120,
@@ -624,18 +675,17 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(store.revision(), revision);
-        let stored = store.project().track(track).unwrap().clip(clip).unwrap();
+        let stored = store.project().pattern(pattern).unwrap();
         assert_eq!(stored.note(first).unwrap().key, 60);
         assert_eq!(stored.note(second).unwrap().key, 64);
     }
 
     #[test]
     fn remove_notes_deduplicates_ids() {
-        let (mut store, track, clip) = fixture();
+        let (mut store, _track, pattern, _clip) = fixture();
         let note = store
             .apply(EditCommand::AddNote {
-                track,
-                clip,
+                pattern,
                 key: 60,
                 velocity: 100,
                 start: Ticks(0),
@@ -647,32 +697,21 @@ mod tests {
 
         let outcome = store
             .apply(EditCommand::RemoveNotes {
-                track,
-                clip,
+                pattern,
                 notes: vec![note, note],
             })
             .unwrap();
 
         assert_eq!(outcome.removed_notes, 1);
-        assert!(
-            store
-                .project()
-                .track(track)
-                .unwrap()
-                .clip(clip)
-                .unwrap()
-                .notes
-                .is_empty()
-        );
+        assert!(store.project().pattern(pattern).unwrap().notes.is_empty());
     }
 
     #[test]
     fn resize_and_velocity_are_validated() {
-        let (mut store, track, clip) = fixture();
+        let (mut store, _track, pattern, _clip) = fixture();
         let note = store
             .apply(EditCommand::AddNote {
-                track,
-                clip,
+                pattern,
                 key: 60,
                 velocity: 100,
                 start: Ticks(0),
@@ -685,8 +724,7 @@ mod tests {
         assert!(
             store
                 .apply(EditCommand::ResizeNote {
-                    track,
-                    clip,
+                    pattern,
                     note,
                     start: Ticks(0),
                     length: Ticks::ZERO,
@@ -696,8 +734,7 @@ mod tests {
         assert!(
             store
                 .apply(EditCommand::SetNoteVelocity {
-                    track,
-                    clip,
+                    pattern,
                     note,
                     velocity: 0,
                 })
@@ -706,13 +743,100 @@ mod tests {
 
         let note_ref: &Note = store
             .project()
-            .track(track)
-            .unwrap()
-            .clip(clip)
+            .pattern(pattern)
             .unwrap()
             .note(note)
             .unwrap();
         assert_eq!(note_ref.length, Ticks(480));
         assert_eq!(note_ref.velocity, 100);
+    }
+
+    #[test]
+    fn removing_a_pattern_removes_its_placements() {
+        let (mut store, track, pattern, clip) = fixture();
+        let other = store
+            .apply(EditCommand::AddPattern {
+                name: "Chorus".into(),
+                length: Ticks(1920),
+            })
+            .unwrap()
+            .pattern
+            .unwrap();
+        let other_clip = store
+            .apply(EditCommand::AddClip {
+                track,
+                pattern: other,
+                start: Ticks::ZERO,
+            })
+            .unwrap()
+            .clip
+            .unwrap();
+
+        store.apply(EditCommand::RemovePattern { pattern }).unwrap();
+
+        let stored = store.project().track(track).unwrap();
+        assert!(stored.clip(clip).is_none());
+        assert!(stored.clip(other_clip).is_some());
+        assert!(store.project().pattern(pattern).is_none());
+        assert!(store.project().pattern(other).is_some());
+
+        store.undo();
+        assert!(store.project().pattern(pattern).is_some());
+        assert!(store.project().track(track).unwrap().clip(clip).is_some());
+    }
+
+    #[test]
+    fn cloned_patterns_are_independent() {
+        let (mut store, _track, pattern, _clip) = fixture();
+        store
+            .apply(EditCommand::AddNote {
+                pattern,
+                key: 60,
+                velocity: 100,
+                start: Ticks(0),
+                length: Ticks(480),
+            })
+            .unwrap();
+
+        let clone = store
+            .apply(EditCommand::ClonePattern { pattern })
+            .unwrap()
+            .pattern
+            .unwrap();
+        assert_ne!(clone, pattern);
+
+        store
+            .apply(EditCommand::AddNote {
+                pattern: clone,
+                key: 64,
+                velocity: 100,
+                start: Ticks(480),
+                length: Ticks(480),
+            })
+            .unwrap();
+
+        assert_eq!(store.project().pattern(pattern).unwrap().notes.len(), 1);
+        assert_eq!(store.project().pattern(clone).unwrap().notes.len(), 2);
+    }
+
+    #[test]
+    fn pattern_name_must_not_be_empty() {
+        let (mut store, _track, _pattern, _clip) = fixture();
+        assert!(
+            store
+                .apply(EditCommand::AddPattern {
+                    name: "   ".into(),
+                    length: Ticks(1920),
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .apply(EditCommand::AddPattern {
+                    name: "Bass".into(),
+                    length: Ticks::ZERO,
+                })
+                .is_err()
+        );
     }
 }

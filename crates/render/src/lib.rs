@@ -104,9 +104,10 @@ mod tests {
     fn demo_project() -> Project {
         let mut project = Project::new("Render test");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(1920)).unwrap();
+        let pattern = project.add_pattern("Clip", Ticks(1920)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
         project
-            .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks(960))
+            .add_note(pattern, 60, 100, Ticks::ZERO, Ticks(960))
             .unwrap();
         project
     }

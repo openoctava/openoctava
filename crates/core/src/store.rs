@@ -118,20 +118,20 @@ impl ProjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Project, TrackId};
+    use crate::model::{PatternId, Project, TrackId};
     use crate::time::Ticks;
 
-    fn fixture() -> (ProjectStore, TrackId, crate::model::ClipId) {
+    fn fixture() -> (ProjectStore, TrackId, PatternId) {
         let mut project = Project::new("Test");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(3840)).unwrap();
-        (ProjectStore::new(project), track, clip)
+        let pattern = project.add_pattern("Verse", Ticks(3840)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
+        (ProjectStore::new(project), track, pattern)
     }
 
-    fn add_note_command(track: TrackId, clip: crate::model::ClipId) -> EditCommand {
+    fn add_note_command(pattern: PatternId) -> EditCommand {
         EditCommand::AddNote {
-            track,
-            clip,
+            pattern,
             key: 60,
             velocity: 100,
             start: Ticks::ZERO,
@@ -141,10 +141,10 @@ mod tests {
 
     #[test]
     fn undo_and_redo_restore_project_state() {
-        let (mut store, track, clip) = fixture();
+        let (mut store, _track, pattern) = fixture();
         assert!(!store.is_dirty());
 
-        store.apply(add_note_command(track, clip)).unwrap();
+        store.apply(add_note_command(pattern)).unwrap();
         assert_eq!(store.project().note_count(), 1);
         assert!(store.is_dirty());
         assert!(store.can_undo());
@@ -159,12 +159,12 @@ mod tests {
 
     #[test]
     fn undo_back_to_saved_revision_clears_dirty_flag() {
-        let (mut store, track, clip) = fixture();
-        store.apply(add_note_command(track, clip)).unwrap();
+        let (mut store, _track, pattern) = fixture();
+        store.apply(add_note_command(pattern)).unwrap();
         store.mark_saved();
         assert!(!store.is_dirty());
 
-        store.apply(add_note_command(track, clip)).unwrap();
+        store.apply(add_note_command(pattern)).unwrap();
         assert!(store.is_dirty());
         store.undo();
         assert!(!store.is_dirty());
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn failed_command_does_not_touch_history_or_revision() {
-        let (mut store, _track, _clip) = fixture();
+        let (mut store, _track, _pattern) = fixture();
         let revision = store.revision();
 
         let result = store.apply(EditCommand::RemoveTrack {
@@ -186,10 +186,10 @@ mod tests {
 
     #[test]
     fn undo_limit_discards_old_history() {
-        let (mut store, track, clip) = fixture();
+        let (mut store, _track, pattern) = fixture();
         store.set_undo_limit(2);
         for _ in 0..5 {
-            store.apply(add_note_command(track, clip)).unwrap();
+            store.apply(add_note_command(pattern)).unwrap();
         }
 
         assert!(store.undo());

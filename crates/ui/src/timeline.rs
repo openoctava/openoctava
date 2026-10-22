@@ -2,9 +2,12 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, RichText, Sense, Stroke, StrokeKind,
     pos2, vec2,
 };
-use octava_core::{EditCommand, Project, Ticks, Track};
+use octava_core::{EditCommand, PatternId, Project, Ticks, Track};
 
-use crate::state::{ClipDrag, ClipDragKind, PlaybackView, TrackDrag, UiAction, UiState};
+use crate::state::{
+    ClipDrag, ClipDragKind, ClipRef, ClipboardClip, PatternDragPayload, PendingClip, PlaybackView,
+    TrackDrag, UiAction, UiState,
+};
 use crate::theme;
 
 const HEADER_WIDTH: f32 = 168.0;
@@ -37,18 +40,15 @@ pub(crate) fn show(
     let px_per_bar = px_per_tick * bar_ticks;
 
     let timeline_rect = Rect::from_min_max(pos2(timeline_left, rect.top()), rect.max);
+    let lanes_top = rect.top() + RULER_HEIGHT;
     let max_lanes = ((rect.height() - RULER_HEIGHT) / LANE_HEIGHT).floor() as usize;
     let visible_tracks = project.tracks.len().min(max_lanes);
 
+    handle_shortcuts(ui, project, playback, state, actions);
+
     if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
         update_clip_drag(project, state, px_per_tick, pointer.x);
-        update_track_drag(
-            project,
-            state,
-            pointer.y,
-            rect.top() + RULER_HEIGHT,
-            visible_tracks,
-        );
+        update_track_drag(project, state, pointer.y, lanes_top, visible_tracks);
     }
 
     let painter = ui.painter_at(rect);
@@ -100,7 +100,7 @@ pub(crate) fn show(
     }
 
     for (index, track) in project.tracks.iter().take(visible_tracks).enumerate() {
-        let lane_top = rect.top() + RULER_HEIGHT + index as f32 * LANE_HEIGHT;
+        let lane_top = lanes_top + index as f32 * LANE_HEIGHT;
         let lane_bottom = (lane_top + LANE_HEIGHT).min(rect.bottom());
         let header_rect = Rect::from_min_max(
             pos2(rect.left(), lane_top),
@@ -124,16 +124,14 @@ pub(crate) fn show(
             });
         }
         header_response.context_menu(|ui| {
+            let pattern = target_pattern(project, state);
             if ui
-                .button("Add Clip at Playhead")
-                .on_hover_text("Create a 4-bar clip")
+                .add_enabled(pattern.is_some(), egui::Button::new("Add Clip at Playhead"))
+                .on_hover_text("Place the selected clip from the Clips panel")
                 .clicked()
+                && let (Some(pattern), Some(track)) = (pattern, Some(track.id))
             {
-                actions.push(UiAction::Edit(EditCommand::AddClip {
-                    track: track.id,
-                    start: playback.playhead,
-                    length: Ticks(bar_ticks.max(1.0) as u64 * 4),
-                }));
+                place_clip(state, actions, track, pattern, playback.playhead);
                 ui.close();
             }
             ui.separator();
@@ -231,12 +229,13 @@ pub(crate) fn show(
             );
         }
 
-        draw_track_header(ui, track, header_rect, selected);
+        draw_track_header(ui, project, track, header_rect, selected);
         draw_track_clips(
             ui,
+            project,
             track,
-            index,
             state,
+            actions,
             timeline_left,
             px_per_tick,
             lane_top,
@@ -277,16 +276,6 @@ pub(crate) fn show(
                 }));
                 ui.close();
             }
-            if let Some(track) = state.selected_track
-                && ui.button("Add Clip at Playhead").clicked()
-            {
-                actions.push(UiAction::Edit(EditCommand::AddClip {
-                    track,
-                    start: playback.playhead,
-                    length: Ticks(bar_ticks.max(1.0) as u64 * 4),
-                }));
-                ui.close();
-            }
         });
     }
 
@@ -303,16 +292,6 @@ pub(crate) fn show(
         if ui.button("Add Track").clicked() {
             actions.push(UiAction::Edit(EditCommand::AddTrack {
                 name: format!("Track {}", project.tracks.len() + 1),
-            }));
-            ui.close();
-        }
-        if let Some(track) = state.selected_track
-            && ui.button("Add Clip at Playhead").clicked()
-        {
-            actions.push(UiAction::Edit(EditCommand::AddClip {
-                track,
-                start: playback.playhead,
-                length: Ticks(bar_ticks.max(1.0) as u64 * 4),
             }));
             ui.close();
         }
@@ -363,9 +342,182 @@ pub(crate) fn show(
         )));
     }
 
+    // Drop target for clips dragged out of the clips library.
+    handle_pattern_drop(
+        ui,
+        project,
+        state,
+        actions,
+        &response,
+        rect,
+        timeline_left,
+        lanes_top,
+        visible_tracks,
+        px_per_tick,
+    );
+
     if ui.input(|input| input.pointer.any_released()) {
         finish_clip_drag(state, actions);
         finish_track_drag(state, actions);
+    }
+}
+
+fn target_pattern(project: &Project, state: &UiState) -> Option<PatternId> {
+    state
+        .selected_pattern
+        .filter(|id| project.pattern(*id).is_some())
+        .or_else(|| project.patterns.first().map(|pattern| pattern.id))
+}
+
+fn place_clip(
+    state: &mut UiState,
+    actions: &mut Vec<UiAction>,
+    track: octava_core::TrackId,
+    pattern: PatternId,
+    start: Ticks,
+) {
+    state.pending_clip = Some(PendingClip {
+        track,
+        pattern,
+        start,
+    });
+    actions.push(UiAction::Edit(EditCommand::AddClip {
+        track,
+        pattern,
+        start,
+    }));
+}
+
+fn handle_shortcuts(
+    ui: &egui::Ui,
+    project: &Project,
+    playback: &PlaybackView,
+    state: &mut UiState,
+    actions: &mut Vec<UiAction>,
+) {
+    if ui.ctx().egui_wants_keyboard_input() {
+        return;
+    }
+
+    let (copy, paste, duplicate) = ui.input(|input| {
+        let command = input.modifiers.command;
+        (
+            command && input.key_pressed(egui::Key::C),
+            command && input.key_pressed(egui::Key::V),
+            command && input.key_pressed(egui::Key::D),
+        )
+    });
+
+    if copy
+        && let Some(selection) = state.selected_clip
+        && let Some(clip) = project
+            .track(selection.track)
+            .and_then(|track| track.clip(selection.clip))
+    {
+        state.clipboard = Some(ClipboardClip {
+            pattern: clip.pattern,
+            length: clip.length,
+        });
+    }
+
+    if paste
+        && let Some(entry) = state.clipboard
+        && let Some(track) = state.selected_track
+    {
+        // Paste at the playhead so that repeated Ctrl+V lays clips out in a row.
+        let start = Ticks(
+            state
+                .snap
+                .snap_tick(playback.playhead.0 as f64, project.tempo_map.ppq()),
+        );
+        place_clip(state, actions, track, entry.pattern, start);
+    }
+
+    if duplicate
+        && let Some(selection) = state.selected_clip
+        && let Some(clip) = project
+            .track(selection.track)
+            .and_then(|track| track.clip(selection.clip))
+    {
+        // Duplicate lands immediately after the original.
+        let start = clip.end();
+        place_clip(state, actions, selection.track, clip.pattern, start);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_pattern_drop(
+    ui: &egui::Ui,
+    project: &Project,
+    state: &mut UiState,
+    actions: &mut Vec<UiAction>,
+    response: &egui::Response,
+    rect: Rect,
+    timeline_left: f32,
+    lanes_top: f32,
+    visible_tracks: usize,
+    px_per_tick: f64,
+) {
+    // `dnd_release_payload` consumes the payload, so it may only be read once;
+    // `dnd_hover_payload` is the non-destructive variant used for the ghost.
+    let released = response.dnd_release_payload::<PatternDragPayload>();
+    let hovered = response.dnd_hover_payload::<PatternDragPayload>();
+    let Some(payload) = released.as_ref().or(hovered.as_ref()) else {
+        return;
+    };
+    let Some(pattern) = project.pattern(payload.pattern) else {
+        return;
+    };
+    let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) else {
+        return;
+    };
+    if pointer.x < timeline_left || pointer.y < lanes_top {
+        return;
+    }
+
+    let lane = ((pointer.y - lanes_top) / LANE_HEIGHT).floor();
+    if lane < 0.0 || lane as usize >= visible_tracks {
+        return;
+    }
+    let Some(track) = project.tracks.get(lane as usize) else {
+        return;
+    };
+    let tick = ((pointer.x - timeline_left) as f64 / px_per_tick).max(0.0);
+    let start = Ticks(state.snap.snap_tick(tick, project.tempo_map.ppq()));
+
+    // Ghost preview of the clip that would be created.
+    let x0 = timeline_left + (start.0 as f64 * px_per_tick) as f32;
+    let x1 = timeline_left + ((start.0 + pattern.length.0) as f64 * px_per_tick) as f32;
+    let lane_top = lanes_top + lane * LANE_HEIGHT;
+    let ghost = Rect::from_min_max(
+        pos2(x0, lane_top + 7.0),
+        pos2(x1.max(x0 + 4.0), lane_top + LANE_HEIGHT - 7.0),
+    );
+    let clip_painter = ui.painter_at(Rect::from_min_max(
+        rect.min,
+        pos2(rect.right(), rect.bottom()),
+    ));
+    clip_painter.rect_filled(
+        ghost,
+        CornerRadius::same(3),
+        theme::ACCENT.gamma_multiply(0.18),
+    );
+    clip_painter.rect_stroke(
+        ghost,
+        CornerRadius::same(3),
+        Stroke::new(1.5, theme::ACCENT),
+        StrokeKind::Inside,
+    );
+    clip_painter.text(
+        pos2(ghost.left() + 6.0, ghost.top() + 8.0),
+        Align2::LEFT_CENTER,
+        &pattern.name,
+        FontId::proportional(9.5),
+        theme::ACCENT,
+    );
+
+    if released.is_some() {
+        place_clip(state, actions, track.id, pattern.id, start);
     }
 }
 
@@ -473,7 +625,7 @@ fn finish_clip_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
     }
 }
 
-fn draw_track_header(ui: &egui::Ui, track: &Track, rect: Rect, selected: bool) {
+fn draw_track_header(ui: &egui::Ui, project: &Project, track: &Track, rect: Rect, selected: bool) {
     let painter = ui.painter_at(rect);
     painter.text(
         pos2(rect.left() + 12.0, rect.top() + 9.0),
@@ -492,7 +644,7 @@ fn draw_track_header(ui: &egui::Ui, track: &Track, rect: Rect, selected: bool) {
         format!(
             "Ch {}  ·  {} notes",
             u16::from(track.channel) + 1,
-            track.note_count()
+            project.track_note_count(track.id)
         ),
         FontId::proportional(9.5),
         theme::TEXT_FAINT,
@@ -529,21 +681,25 @@ fn draw_badge(painter: &egui::Painter, x: &mut f32, y: f32, text: &str, color: C
 #[allow(clippy::too_many_arguments)]
 fn draw_track_clips(
     ui: &egui::Ui,
+    project: &Project,
     track: &Track,
-    track_index: usize,
     state: &mut UiState,
+    actions: &mut Vec<UiAction>,
     timeline_left: f32,
     px_per_tick: f64,
     lane_top: f32,
     lane_bottom: f32,
 ) {
-    let color = theme::track_color(track_index);
     let clip_painter = ui.painter_at(Rect::from_min_max(
         pos2(timeline_left, lane_top),
         pos2(ui.max_rect().right(), lane_bottom),
     ));
 
     for clip in &track.clips {
+        let Some(pattern) = project.pattern(clip.pattern) else {
+            continue;
+        };
+        let color = theme::pattern_color(project.pattern_index(pattern.id).unwrap_or(0));
         let dragging = state
             .clip_drag
             .filter(|drag| drag.track == track.id && drag.clip == clip.id);
@@ -565,7 +721,7 @@ fn draw_track_clips(
             Sense::click_and_drag(),
         );
         if response.clicked() {
-            state.select_clip(track.id, clip.id);
+            state.select_clip(project, track.id, clip.id);
         }
         if response.drag_started() {
             let origin = ui
@@ -577,7 +733,7 @@ fn draw_track_clips(
             } else {
                 ClipDragKind::Move
             };
-            state.select_clip(track.id, clip.id);
+            state.select_clip(project, track.id, clip.id);
             state.track_drag = None;
             state.clip_drag = Some(ClipDrag {
                 track: track.id,
@@ -607,8 +763,42 @@ fn draw_track_clips(
                 CursorIcon::Grab
             });
         }
-        let selected =
-            state.selected_track == Some(track.id) && state.selected_clip == Some(clip.id);
+
+        let selection = ClipRef {
+            track: track.id,
+            clip: clip.id,
+        };
+        let selected = state.selected_clip == Some(selection);
+
+        response.context_menu(|ui| {
+            if ui.button("Copy").on_hover_text("Ctrl+C").clicked() {
+                state.clipboard = Some(ClipboardClip {
+                    pattern: clip.pattern,
+                    length: clip.length,
+                });
+                ui.close();
+            }
+            if ui
+                .button("Duplicate")
+                .on_hover_text("Insert a copy right after this clip (Ctrl+D)")
+                .clicked()
+            {
+                let start = clip.end();
+                place_clip(state, actions, track.id, clip.pattern, start);
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .button(RichText::new("Delete").color(Color32::from_rgb(222, 112, 102)))
+                .clicked()
+            {
+                actions.push(UiAction::Edit(EditCommand::RemoveClip {
+                    track: track.id,
+                    clip: clip.id,
+                }));
+                ui.close();
+            }
+        });
 
         clip_painter.rect_filled(clip_rect, CornerRadius::same(3), color.gamma_multiply(0.24));
         clip_painter.rect_filled(
@@ -627,14 +817,14 @@ fn draw_track_clips(
         clip_painter.text(
             pos2(clip_rect.left() + 6.0, clip_rect.top() + 8.0),
             Align2::LEFT_CENTER,
-            format!("Clip {}", clip.id.get()),
+            &pattern.name,
             FontId::proportional(9.5),
             color,
         );
         clip_painter.text(
             pos2(clip_rect.left() + 4.0, clip_rect.bottom() - 8.0),
             Align2::LEFT_BOTTOM,
-            format!("{} notes", clip.notes.len()),
+            format!("{} notes", pattern.notes.len()),
             FontId::proportional(9.0),
             theme::TEXT_DIM,
         );

@@ -2,7 +2,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, Response, RichText, Sense, Stroke,
     StrokeKind, Vec2, pos2, vec2,
 };
-use octava_core::{EditCommand, MidiClip, Project, Ticks, Track};
+use octava_core::{EditCommand, Pattern, Project, Ticks, TrackId};
 
 use crate::state::{
     NoteDrag, NoteDragKind, NoteRef, PlaybackView, SnapDivision, SnapSettings, UiAction, UiState,
@@ -19,7 +19,7 @@ const MAX_PX_PER_BEAT: f32 = 1200.0;
 pub(crate) fn show(
     ui: &mut egui::Ui,
     project: &Project,
-    playback: &PlaybackView,
+    _playback: &PlaybackView,
     state: &mut UiState,
     actions: &mut Vec<UiAction>,
 ) {
@@ -34,26 +34,20 @@ pub(crate) fn show(
         return;
     }
 
-    let Some(track) = state.selected_track(project) else {
+    let Some(pattern) = state.selected_pattern.and_then(|id| project.pattern(id)) else {
         ui.painter_at(rect).text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "Add a track to open the piano roll",
+            "Select a clip in the Clips panel",
             FontId::proportional(14.0),
             theme::TEXT_DIM,
         );
         return;
     };
-    let Some(clip) = state.selected_clip.and_then(|clip| track.clip(clip)) else {
-        ui.painter_at(rect).text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "Select a clip in the Timeline or Clips panel",
-            FontId::proportional(14.0),
-            theme::TEXT_DIM,
-        );
-        return;
-    };
+    // Auditioning needs a channel; borrow the selected track for that.
+    let audition_track = state
+        .selected_track
+        .or_else(|| project.tracks.first().map(|track| track.id));
 
     let grid_top = rect.top() + RULER_HEIGHT;
     let grid_left = rect.left() + GUTTER_WIDTH;
@@ -66,29 +60,37 @@ pub(crate) fn show(
         scroll_y: state.piano_roll.scroll_y,
         key_height: state.piano_roll.key_height,
     };
-    let track_index = project.track_index(track.id).unwrap_or(0);
+    let pattern_index = project.pattern_index(pattern.id).unwrap_or(0);
 
-    handle_input(ui, project, track, clip, state, &response, &grid, actions);
+    handle_input(
+        ui,
+        project,
+        pattern,
+        audition_track,
+        state,
+        &response,
+        &grid,
+        actions,
+    );
 
     draw_key_rows(ui, &grid, rect);
-    draw_clip(ui, &grid, clip, track_index);
+    draw_pattern_region(ui, &grid, pattern, pattern_index);
     draw_grid_lines(ui, project, &grid, rect, state.snap);
-    draw_notes(ui, &grid, track, clip, track_index, state);
+    draw_notes(ui, &grid, pattern, pattern_index, state);
     draw_ruler(ui, project, &grid, rect);
-    draw_playhead(ui, &grid, playback);
 
-    if clip.notes.is_empty() {
+    if pattern.notes.is_empty() {
         let clip_left = grid
-            .tick_to_x(clip.start.0 as f64)
+            .tick_to_x(0.0)
             .clamp(grid.rect.left(), grid.rect.right());
         let clip_right = grid
-            .tick_to_x(clip.end().0 as f64)
+            .tick_to_x(pattern.length.0 as f64)
             .clamp(grid.rect.left(), grid.rect.right());
         let center = pos2((clip_left + clip_right) / 2.0, grid.rect.center().y);
         ui.painter_at(grid.rect).text(
             center,
             Align2::CENTER_CENTER,
-            "Click inside the clip to add a note",
+            "Click to add a note",
             FontId::proportional(12.0),
             theme::TEXT_FAINT,
         );
@@ -187,8 +189,8 @@ fn toolbar(ui: &mut egui::Ui, state: &mut UiState, actions: &mut Vec<UiAction>) 
 fn handle_input(
     ui: &egui::Ui,
     project: &Project,
-    track: &Track,
-    clip: &MidiClip,
+    pattern: &Pattern,
+    audition_track: Option<TrackId>,
     state: &mut UiState,
     response: &Response,
     grid: &Grid,
@@ -199,7 +201,7 @@ fn handle_input(
     let bar_ticks = project
         .time_signature
         .ticks_per_bar(project.tempo_map.ppq()) as f64;
-    let max_left = project.length_ticks().0 as f64 + bar_ticks * 16.0;
+    let max_left = pattern.length.0 as f64 + bar_ticks * 8.0;
 
     if response.hovered() {
         let (scroll, zoom, shift, pointer) = ui.input(|input| {
@@ -251,9 +253,10 @@ fn handle_input(
         && pointer.x < grid.rect.left()
         && pointer.y >= grid.rect.top()
         && pointer.y <= grid.rect.bottom()
+        && let Some(track) = audition_track
     {
         actions.push(UiAction::AuditionNote {
-            track: track.id,
+            track,
             key: key_at_y(grid, pointer.y),
             velocity: 100,
         });
@@ -262,7 +265,7 @@ fn handle_input(
     if response.drag_started()
         && let Some(origin) = ui.input(|input| input.pointer.press_origin())
         && grid.rect.contains(origin)
-        && let Some(hit) = hit_test_note(track, clip, grid, origin)
+        && let Some(hit) = hit_test_note(pattern, grid, origin)
     {
         let edge_zone = (hit.rect.width() * 0.25).clamp(4.0, 10.0);
         let kind = if hit.rect.width() > 12.0 && origin.x >= hit.rect.right() - edge_zone {
@@ -270,7 +273,7 @@ fn handle_input(
         } else {
             NoteDragKind::Move
         };
-        state.select_clip(hit.note.track, hit.note.clip);
+        state.select_pattern(hit.note.pattern);
         state.selected_note = Some(hit.note);
         state.note_drag = Some(NoteDrag {
             note: hit.note,
@@ -288,7 +291,15 @@ fn handle_input(
     if state.note_drag.is_some()
         && let Some(pointer) = ui.input(|input| input.pointer.latest_pos())
     {
-        update_note_drag(project, grid, state, pointer, actions);
+        update_note_drag(
+            project,
+            grid,
+            pattern,
+            audition_track,
+            state,
+            pointer,
+            actions,
+        );
     }
 
     if response.hovered()
@@ -300,7 +311,7 @@ fn handle_input(
                 NoteDragKind::Move => CursorIcon::Grabbing,
             });
         } else if grid.rect.contains(pointer)
-            && let Some(hit) = hit_test_note(track, clip, grid, pointer)
+            && let Some(hit) = hit_test_note(pattern, grid, pointer)
         {
             let edge_zone = (hit.rect.width() * 0.25).clamp(4.0, 10.0);
             let cursor = if hit.rect.width() > 12.0 && pointer.x >= hit.rect.right() - edge_zone {
@@ -315,20 +326,12 @@ fn handle_input(
     if response.clicked()
         && let Some(pointer) = response.interact_pointer_pos()
     {
-        if pointer.y < grid.rect.top() && pointer.x > grid.rect.left() {
-            let tick = grid.x_to_tick(pointer.x).max(0.0);
-            actions.push(UiAction::Seek(Ticks(
-                state.snap.snap_tick(tick, project.tempo_map.ppq()),
-            )));
-            return;
-        }
-
         if !grid.rect.contains(pointer) {
             return;
         }
 
-        if let Some(hit) = hit_test_note(track, clip, grid, pointer) {
-            state.select_clip(hit.note.track, hit.note.clip);
+        if let Some(hit) = hit_test_note(pattern, grid, pointer) {
+            state.select_pattern(hit.note.pattern);
             state.selected_note = Some(hit.note);
             return;
         }
@@ -340,9 +343,8 @@ fn handle_input(
         let tick = state
             .snap
             .snap_tick(grid.x_to_tick(pointer.x), project.tempo_map.ppq());
-        if tick >= clip.start.0 && tick < clip.end().0 {
-            let start = tick - clip.start.0;
-            let available = clip.length.0.saturating_sub(start);
+        if tick < pattern.length.0 {
+            let available = pattern.length.0.saturating_sub(tick);
             let length = state
                 .snap
                 .division
@@ -352,11 +354,10 @@ fn handle_input(
                 let key = key_at_y(grid, pointer.y);
                 state.selected_note = None;
                 actions.push(UiAction::Edit(EditCommand::AddNote {
-                    track: track.id,
-                    clip: clip.id,
+                    pattern: pattern.id,
                     key,
                     velocity: 100,
-                    start: Ticks(start),
+                    start: Ticks(tick),
                     length: Ticks(length),
                 }));
             }
@@ -373,9 +374,12 @@ fn handle_input(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_note_drag(
     project: &Project,
     grid: &Grid,
+    pattern: &Pattern,
+    audition_track: Option<TrackId>,
     state: &mut UiState,
     pointer: egui::Pos2,
     actions: &mut Vec<UiAction>,
@@ -383,58 +387,50 @@ fn update_note_drag(
     let Some(drag) = state.note_drag else {
         return;
     };
-    let Some(track) = project.track(drag.note.track) else {
-        state.note_drag = None;
-        return;
-    };
-    let Some(clip) = track.clip(drag.note.clip) else {
-        state.note_drag = None;
-        return;
-    };
-    if clip.note(drag.note.note).is_none() {
+    if pattern.note(drag.note.note).is_none() {
         state.note_drag = None;
         return;
     }
 
     let delta_ticks = f64::from(pointer.x - drag.pointer_start.x) / grid.px_per_tick;
-    let clip_start = clip.start.0;
-    let clip_end = clip.end().0;
+    let pattern_length = pattern.length.0;
 
     let mut next = drag;
     match drag.kind {
         NoteDragKind::Move => {
-            let original_global = clip_start as f64 + drag.original_start.0 as f64;
-            let max_start = clip_end
-                .saturating_sub(drag.original_length.0)
-                .max(clip_start);
-            let global_start = state
+            let max_start = pattern_length.saturating_sub(drag.original_length.0);
+            let start = state
                 .snap
-                .snap_tick(original_global + delta_ticks, project.tempo_map.ppq())
-                .clamp(clip_start, max_start);
-            next.preview_start = Ticks(global_start - clip_start);
+                .snap_tick(
+                    drag.original_start.0 as f64 + delta_ticks,
+                    project.tempo_map.ppq(),
+                )
+                .min(max_start);
+            next.preview_start = Ticks(start);
             next.preview_length = drag.original_length;
 
             let delta_key = (-(pointer.y - drag.pointer_start.y) / grid.key_height).round() as i32;
             next.preview_key = (i32::from(drag.original_key) + delta_key).clamp(0, 127) as u8;
         }
         NoteDragKind::Resize => {
-            let start_global = clip_start + drag.original_start.0;
-            let min_end = start_global.saturating_add(1);
-            let max_end = clip_end.max(min_end);
-            let original_end = start_global + drag.original_length.0;
+            let min_end = drag.original_start.0.saturating_add(1);
+            let max_end = pattern_length.max(min_end);
+            let original_end = drag.original_start.0 + drag.original_length.0;
             let end = state
                 .snap
                 .snap_tick(original_end as f64 + delta_ticks, project.tempo_map.ppq())
                 .clamp(min_end, max_end);
             next.preview_start = drag.original_start;
-            next.preview_length = Ticks(end - start_global);
+            next.preview_length = Ticks(end - drag.original_start.0);
             next.preview_key = drag.original_key;
         }
     }
 
-    if next.preview_key != drag.preview_key {
+    if next.preview_key != drag.preview_key
+        && let Some(track) = audition_track
+    {
         actions.push(UiAction::AuditionNote {
-            track: drag.note.track,
+            track,
             key: next.preview_key,
             velocity: 100,
         });
@@ -454,8 +450,7 @@ fn finish_note_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
             let delta_key = i32::from(drag.preview_key) - i32::from(drag.original_key);
             if delta_ticks != 0 || delta_key != 0 {
                 actions.push(UiAction::Edit(EditCommand::MoveNotes {
-                    track: drag.note.track,
-                    clip: drag.note.clip,
+                    pattern: drag.note.pattern,
                     notes: vec![drag.note.note],
                     delta_ticks,
                     delta_key,
@@ -465,8 +460,7 @@ fn finish_note_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
         NoteDragKind::Resize => {
             if drag.preview_length != drag.original_length {
                 actions.push(UiAction::Edit(EditCommand::ResizeNote {
-                    track: drag.note.track,
-                    clip: drag.note.clip,
+                    pattern: drag.note.pattern,
                     note: drag.note.note,
                     start: drag.preview_start,
                     length: drag.preview_length,
@@ -481,8 +475,7 @@ fn delete_selected_note(state: &mut UiState, actions: &mut Vec<UiAction>) {
         return;
     };
     actions.push(UiAction::Edit(EditCommand::RemoveNotes {
-        track: selection.track,
-        clip: selection.clip,
+        pattern: selection.pattern,
         notes: vec![selection.note],
     }));
 }
@@ -500,28 +493,21 @@ struct NoteHit {
     rect: Rect,
 }
 
-fn hit_test_note(
-    track: &Track,
-    clip: &MidiClip,
-    grid: &Grid,
-    pointer: egui::Pos2,
-) -> Option<NoteHit> {
+fn hit_test_note(pattern: &Pattern, grid: &Grid, pointer: egui::Pos2) -> Option<NoteHit> {
     let mut hit = None;
-    for note in &clip.notes {
-        let start = clip.start.0.saturating_add(note.start.0);
+    for note in &pattern.notes {
         let length = note
             .length
             .0
-            .min(clip.length.0.saturating_sub(note.start.0));
+            .min(pattern.length.0.saturating_sub(note.start.0));
         if length == 0 {
             continue;
         }
-        let rect = note_screen_rect(grid, start, length, note.key);
+        let rect = note_screen_rect(grid, note.start.0, length, note.key);
         if rect.contains(pointer) {
             hit = Some(NoteHit {
                 note: NoteRef {
-                    track: track.id,
-                    clip: clip.id,
+                    pattern: pattern.id,
                     note: note.id,
                 },
                 start: note.start.0,
@@ -663,12 +649,12 @@ fn draw_key_rows(ui: &egui::Ui, grid: &Grid, panel: Rect) {
     );
 }
 
-fn draw_clip(ui: &egui::Ui, grid: &Grid, clip: &MidiClip, track_index: usize) {
+fn draw_pattern_region(ui: &egui::Ui, grid: &Grid, pattern: &Pattern, pattern_index: usize) {
     let painter = ui.painter_at(grid.rect);
-    let color = theme::track_color(track_index);
+    let color = theme::pattern_color(pattern_index);
 
-    let x0 = grid.tick_to_x(clip.start.0 as f64);
-    let x1 = grid.tick_to_x(clip.end().0 as f64);
+    let x0 = grid.tick_to_x(0.0);
+    let x1 = grid.tick_to_x(pattern.length.0 as f64);
     if x1 < grid.rect.left() || x0 > grid.rect.right() {
         return;
     }
@@ -689,7 +675,7 @@ fn draw_clip(ui: &egui::Ui, grid: &Grid, clip: &MidiClip, track_index: usize) {
     painter.text(
         pos2(left + 6.0, grid.rect.top() + CLIP_HEADER_HEIGHT * 0.5),
         Align2::LEFT_CENTER,
-        clip_title(clip),
+        pattern_title(pattern),
         FontId::proportional(9.5),
         color,
     );
@@ -769,24 +755,22 @@ fn draw_grid_lines(ui: &egui::Ui, project: &Project, grid: &Grid, panel: Rect, s
 fn draw_notes(
     ui: &egui::Ui,
     grid: &Grid,
-    track: &Track,
-    clip: &MidiClip,
-    track_index: usize,
+    pattern: &Pattern,
+    pattern_index: usize,
     state: &UiState,
 ) {
     let painter = ui.painter_at(grid.rect);
-    let color = theme::track_color(track_index);
+    let color = theme::pattern_color(pattern_index);
     let drag = state.note_drag;
 
-    for note in &clip.notes {
-        let clipped_end = note.start.saturating_add(note.length).min(clip.length);
+    for note in &pattern.notes {
+        let clipped_end = note.start.saturating_add(note.length).min(pattern.length);
         if clipped_end <= note.start {
             continue;
         }
 
         let note_ref = NoteRef {
-            track: track.id,
-            clip: clip.id,
+            pattern: pattern.id,
             note: note.id,
         };
         let active_drag = drag.filter(|drag| drag.note == note_ref);
@@ -800,7 +784,7 @@ fn draw_notes(
                 )
             },
         );
-        let start = clip.start.0 as f64 + relative_start as f64;
+        let start = relative_start as f64;
         let end = start + length as f64;
         let x0 = grid.tick_to_x(start);
         let x1 = grid.tick_to_x(end);
@@ -912,33 +896,8 @@ fn draw_ruler(ui: &egui::Ui, project: &Project, grid: &Grid, panel: Rect) {
     );
 }
 
-fn draw_playhead(ui: &egui::Ui, grid: &Grid, playback: &PlaybackView) {
-    let x = grid.tick_to_x(playback.playhead.0 as f64);
-    if x < grid.rect.left() || x > grid.rect.right() {
-        return;
-    }
-
-    let painter = ui.painter_at(grid.rect.expand2(vec2(0.0, RULER_HEIGHT)));
-    painter.line_segment(
-        [
-            pos2(x, grid.rect.top() - RULER_HEIGHT),
-            pos2(x, grid.rect.bottom()),
-        ],
-        Stroke::new(1.5, theme::ACCENT),
-    );
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            pos2(x - 4.0, grid.rect.top() - RULER_HEIGHT + 2.0),
-            pos2(x + 4.0, grid.rect.top() - RULER_HEIGHT + 2.0),
-            pos2(x, grid.rect.top() - RULER_HEIGHT + 9.0),
-        ],
-        theme::ACCENT,
-        Stroke::NONE,
-    ));
-}
-
-fn clip_title(clip: &MidiClip) -> String {
-    format!("Clip {}  ·  {} notes", clip.id.get(), clip.notes.len())
+fn pattern_title(pattern: &Pattern) -> String {
+    format!("{}  ·  {} notes", pattern.name, pattern.notes.len())
 }
 
 fn is_black_key(key: u8) -> bool {

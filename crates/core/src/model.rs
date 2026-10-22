@@ -38,6 +38,7 @@ macro_rules! id_type {
 id_type!(TrackId);
 id_type!(ClipId);
 id_type!(NoteId);
+id_type!(PatternId);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preset {
@@ -63,7 +64,7 @@ pub struct Note {
     pub id: NoteId,
     pub key: u8,
     pub velocity: u8,
-    /// Start relative to the containing clip.
+    /// Start relative to the containing pattern.
     pub start: Ticks,
     pub length: Ticks,
 }
@@ -75,20 +76,22 @@ impl Note {
     }
 }
 
+/// A reusable musical pattern, the unit the musician writes in the clips
+/// panel. Timeline clips are placements of a pattern, so editing the pattern
+/// changes every clip that plays it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct MidiClip {
-    pub id: ClipId,
-    pub start: Ticks,
+pub struct Pattern {
+    pub id: PatternId,
+    pub name: String,
+    /// Instrument reserved for per-pattern sound selection. Not wired to the
+    /// synthesizer yet: a track owns a single MIDI channel and therefore a
+    /// single program.
+    pub preset: Preset,
     pub length: Ticks,
     pub notes: Vec<Note>,
 }
 
-impl MidiClip {
-    #[must_use]
-    pub fn end(&self) -> Ticks {
-        self.start.saturating_add(self.length)
-    }
-
+impl Pattern {
     #[must_use]
     pub fn note(&self, id: NoteId) -> Option<&Note> {
         self.notes.iter().find(|note| note.id == id)
@@ -97,6 +100,34 @@ impl MidiClip {
     #[must_use]
     pub fn note_index(&self, id: NoteId) -> Option<usize> {
         self.notes.iter().position(|note| note.id == id)
+    }
+
+    /// Furthest note end, clamped to the pattern length.
+    #[must_use]
+    pub fn content_end(&self) -> Ticks {
+        self.notes
+            .iter()
+            .map(|note| note.end().min(self.length))
+            .max()
+            .unwrap_or(Ticks::ZERO)
+    }
+}
+
+/// A placement of a [`Pattern`] on a track.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Clip {
+    pub id: ClipId,
+    pub pattern: PatternId,
+    pub start: Ticks,
+    /// Length of this placement. Independent of the pattern length so that a
+    /// pattern can be trimmed per placement.
+    pub length: Ticks,
+}
+
+impl Clip {
+    #[must_use]
+    pub fn end(&self) -> Ticks {
+        self.start.saturating_add(self.length)
     }
 }
 
@@ -114,7 +145,7 @@ pub struct Track {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
-    pub clips: Vec<MidiClip>,
+    pub clips: Vec<Clip>,
 }
 
 impl Track {
@@ -138,18 +169,13 @@ impl Track {
     }
 
     #[must_use]
-    pub fn clip(&self, id: ClipId) -> Option<&MidiClip> {
+    pub fn clip(&self, id: ClipId) -> Option<&Clip> {
         self.clips.iter().find(|clip| clip.id == id)
     }
 
     #[must_use]
     pub fn clip_index(&self, id: ClipId) -> Option<usize> {
         self.clips.iter().position(|clip| clip.id == id)
-    }
-
-    #[must_use]
-    pub fn note_count(&self) -> usize {
-        self.clips.iter().map(|clip| clip.notes.len()).sum()
     }
 }
 
@@ -160,12 +186,17 @@ pub struct Project {
     pub tempo_map: TempoMap,
     pub time_signature: TimeSignature,
     pub tracks: Vec<Track>,
+    /// Reusable patterns. Clips on the timeline reference these by id.
+    #[serde(default)]
+    pub patterns: Vec<Pattern>,
     #[serde(default = "next_id_default")]
     next_track_id: u64,
     #[serde(default = "next_id_default")]
     next_clip_id: u64,
     #[serde(default = "next_id_default")]
     next_note_id: u64,
+    #[serde(default = "next_id_default")]
+    next_pattern_id: u64,
 }
 
 impl Default for Project {
@@ -182,9 +213,11 @@ impl Project {
             tempo_map: TempoMap::default(),
             time_signature: TimeSignature::default(),
             tracks: Vec::new(),
+            patterns: Vec::new(),
             next_track_id: 1,
             next_clip_id: 1,
             next_note_id: 1,
+            next_pattern_id: 1,
         }
     }
 
@@ -201,6 +234,21 @@ impl Project {
     #[must_use]
     pub fn track_index(&self, id: TrackId) -> Option<usize> {
         self.tracks.iter().position(|track| track.id == id)
+    }
+
+    #[must_use]
+    pub fn pattern(&self, id: PatternId) -> Option<&Pattern> {
+        self.patterns.iter().find(|pattern| pattern.id == id)
+    }
+
+    #[must_use]
+    pub fn pattern_mut(&mut self, id: PatternId) -> Option<&mut Pattern> {
+        self.patterns.iter_mut().find(|pattern| pattern.id == id)
+    }
+
+    #[must_use]
+    pub fn pattern_index(&self, id: PatternId) -> Option<usize> {
+        self.patterns.iter().position(|pattern| pattern.id == id)
     }
 
     pub fn add_track(&mut self, name: impl Into<String>) -> Result<TrackId, ModelError> {
@@ -221,14 +269,60 @@ impl Project {
         Ok(id)
     }
 
+    pub fn add_pattern(
+        &mut self,
+        name: impl Into<String>,
+        length: Ticks,
+    ) -> Result<PatternId, ModelError> {
+        if length == Ticks::ZERO {
+            return Err(ModelError::InvalidPatternLength);
+        }
+
+        let id = PatternId(self.next_pattern_id);
+        self.next_pattern_id += 1;
+        self.patterns.push(Pattern {
+            id,
+            name: name.into(),
+            preset: Preset::default(),
+            length,
+            notes: Vec::new(),
+        });
+        Ok(id)
+    }
+
+    /// Copies a pattern, including its notes, under a fresh id. The copy is
+    /// independent of the source: editing one does not affect the other.
+    pub fn clone_pattern(&mut self, id: PatternId) -> Result<PatternId, ModelError> {
+        let source = self
+            .pattern(id)
+            .ok_or(ModelError::PatternNotFound(id))?
+            .clone();
+        let copy = PatternId(self.next_pattern_id);
+        self.next_pattern_id += 1;
+        self.patterns.push(Pattern {
+            id: copy,
+            name: format!("{} copy", source.name),
+            preset: source.preset,
+            length: source.length,
+            notes: source.notes,
+        });
+        Ok(copy)
+    }
+
+    /// Places a pattern on a track. The placement starts out as long as the
+    /// pattern and can be trimmed afterwards.
     pub fn add_clip(
         &mut self,
         track_id: TrackId,
+        pattern_id: PatternId,
         start: Ticks,
-        length: Ticks,
     ) -> Result<ClipId, ModelError> {
+        let length = self
+            .pattern(pattern_id)
+            .ok_or(ModelError::PatternNotFound(pattern_id))?
+            .length;
         if length == Ticks::ZERO {
-            return Err(ModelError::InvalidClipLength);
+            return Err(ModelError::InvalidPatternLength);
         }
 
         let id = ClipId(self.next_clip_id);
@@ -236,19 +330,18 @@ impl Project {
         let track = self
             .track_mut(track_id)
             .ok_or(ModelError::TrackNotFound(track_id))?;
-        track.clips.push(MidiClip {
+        track.clips.push(Clip {
             id,
+            pattern: pattern_id,
             start,
             length,
-            notes: Vec::new(),
         });
         Ok(id)
     }
 
     pub fn add_note(
         &mut self,
-        track_id: TrackId,
-        clip_id: ClipId,
+        pattern_id: PatternId,
         key: u8,
         velocity: u8,
         start: Ticks,
@@ -257,26 +350,18 @@ impl Project {
         validate_key(key)?;
         validate_velocity(velocity)?;
         {
-            let track = self
-                .track(track_id)
-                .ok_or(ModelError::TrackNotFound(track_id))?;
-            let clip = track
-                .clip(clip_id)
-                .ok_or(ModelError::ClipNotFound(clip_id))?;
-            validate_note_geometry(start, length, clip.length)?;
+            let pattern = self
+                .pattern(pattern_id)
+                .ok_or(ModelError::PatternNotFound(pattern_id))?;
+            validate_note_geometry(start, length, pattern.length)?;
         }
 
         let id = NoteId(self.next_note_id);
         self.next_note_id += 1;
-        let track = self
-            .track_mut(track_id)
-            .ok_or(ModelError::TrackNotFound(track_id))?;
-        let clip = track
-            .clips
-            .iter_mut()
-            .find(|clip| clip.id == clip_id)
-            .ok_or(ModelError::ClipNotFound(clip_id))?;
-        clip.notes.push(Note {
+        let pattern = self
+            .pattern_mut(pattern_id)
+            .ok_or(ModelError::PatternNotFound(pattern_id))?;
+        pattern.notes.push(Note {
             id,
             key,
             velocity,
@@ -297,14 +382,42 @@ impl Project {
         self.tracks
             .iter()
             .flat_map(|track| track.clips.iter())
-            .map(MidiClip::end)
+            .map(Clip::end)
             .max()
             .unwrap_or(Ticks::ZERO)
     }
 
     #[must_use]
     pub fn note_count(&self) -> usize {
-        self.tracks.iter().map(Track::note_count).sum()
+        self.tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .filter_map(|clip| self.pattern(clip.pattern))
+            .map(|pattern| pattern.notes.len())
+            .sum()
+    }
+
+    #[must_use]
+    pub fn track_note_count(&self, track_id: TrackId) -> usize {
+        let Some(track) = self.track(track_id) else {
+            return 0;
+        };
+        track
+            .clips
+            .iter()
+            .filter_map(|clip| self.pattern(clip.pattern))
+            .map(|pattern| pattern.notes.len())
+            .sum()
+    }
+
+    /// Number of timeline placements of the given pattern.
+    #[must_use]
+    pub fn pattern_use_count(&self, pattern_id: PatternId) -> usize {
+        self.tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .filter(|clip| clip.pattern == pattern_id)
+            .count()
     }
 
     pub fn apply(
@@ -338,13 +451,13 @@ pub(crate) fn validate_velocity(velocity: u8) -> Result<(), ModelError> {
 pub(crate) fn validate_note_geometry(
     start: Ticks,
     length: Ticks,
-    clip_length: Ticks,
+    pattern_length: Ticks,
 ) -> Result<(), ModelError> {
     if length == Ticks::ZERO {
         return Err(ModelError::InvalidNoteLength);
     }
-    if start >= clip_length {
-        return Err(ModelError::NoteOutsideClip);
+    if start >= pattern_length {
+        return Err(ModelError::NoteOutsidePattern);
     }
     Ok(())
 }
@@ -362,6 +475,8 @@ pub enum ModelError {
     TrackNotFound(TrackId),
     #[error("clip {0} not found")]
     ClipNotFound(ClipId),
+    #[error("pattern {0} not found")]
+    PatternNotFound(PatternId),
     #[error("note {0} not found")]
     NoteNotFound(NoteId),
     #[error("all 16 MIDI channels are already in use")]
@@ -372,10 +487,14 @@ pub enum ModelError {
     InvalidVelocity(u8),
     #[error("clip length must be greater than zero")]
     InvalidClipLength,
+    #[error("pattern length must be greater than zero")]
+    InvalidPatternLength,
     #[error("note length must be greater than zero")]
     InvalidNoteLength,
-    #[error("note start must be inside its clip")]
-    NoteOutsideClip,
+    #[error("note start must be inside its pattern")]
+    NoteOutsidePattern,
+    #[error("pattern name must not be empty")]
+    EmptyPatternName,
     #[error("track name must not be empty")]
     EmptyTrackName,
     #[error("track gain must be finite and in 0.0..=1.0")]
@@ -398,12 +517,13 @@ mod tests {
     fn ids_are_unique_and_counters_survive_roundtrip() {
         let mut project = Project::new("Test");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(3840)).unwrap();
+        let pattern = project.add_pattern("Verse", Ticks(3840)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
         let first = project
-            .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks(480))
+            .add_note(pattern, 60, 100, Ticks::ZERO, Ticks(480))
             .unwrap();
         let second = project
-            .add_note(track, clip, 64, 100, Ticks(480), Ticks(480))
+            .add_note(pattern, 64, 100, Ticks(480), Ticks(480))
             .unwrap();
 
         assert_ne!(first, second);
@@ -414,7 +534,7 @@ mod tests {
 
         let mut restored = restored;
         let third = restored
-            .add_note(track, clip, 67, 100, Ticks(960), Ticks(480))
+            .add_note(pattern, 67, 100, Ticks(960), Ticks(480))
             .unwrap();
         assert_ne!(third, first);
         assert_ne!(third, second);
@@ -423,27 +543,26 @@ mod tests {
     #[test]
     fn rejects_invalid_notes() {
         let mut project = Project::new("Test");
-        let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(960)).unwrap();
+        let pattern = project.add_pattern("Verse", Ticks(960)).unwrap();
 
         assert!(
             project
-                .add_note(track, clip, 128, 100, Ticks::ZERO, Ticks(100))
+                .add_note(pattern, 128, 100, Ticks::ZERO, Ticks(100))
                 .is_err()
         );
         assert!(
             project
-                .add_note(track, clip, 60, 0, Ticks::ZERO, Ticks(100))
+                .add_note(pattern, 60, 0, Ticks::ZERO, Ticks(100))
                 .is_err()
         );
         assert!(
             project
-                .add_note(track, clip, 60, 100, Ticks(960), Ticks(100))
+                .add_note(pattern, 60, 100, Ticks(960), Ticks(100))
                 .is_err()
         );
         assert!(
             project
-                .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks::ZERO)
+                .add_note(pattern, 60, 100, Ticks::ZERO, Ticks::ZERO)
                 .is_err()
         );
     }
@@ -466,9 +585,58 @@ mod tests {
         let mut project = Project::new("Test");
         let a = project.add_track("A").unwrap();
         let b = project.add_track("B").unwrap();
-        project.add_clip(a, Ticks(100), Ticks(500)).unwrap();
-        project.add_clip(b, Ticks(2000), Ticks(10)).unwrap();
+        let pattern = project.add_pattern("Pattern", Ticks(500)).unwrap();
+        let short = project.add_pattern("Short", Ticks(10)).unwrap();
+        project.add_clip(a, pattern, Ticks(100)).unwrap();
+        project.add_clip(b, short, Ticks(2000)).unwrap();
 
         assert_eq!(project.length_ticks(), Ticks(2010));
+    }
+
+    #[test]
+    fn placements_share_the_pattern() {
+        let mut project = Project::new("Test");
+        let a = project.add_track("A").unwrap();
+        let b = project.add_track("B").unwrap();
+        let pattern = project.add_pattern("Hook", Ticks(960)).unwrap();
+        let first = project.add_clip(a, pattern, Ticks::ZERO).unwrap();
+        project.add_clip(b, pattern, Ticks(960)).unwrap();
+        project
+            .add_note(pattern, 60, 100, Ticks::ZERO, Ticks(480))
+            .unwrap();
+
+        // Editing the shared pattern is visible from every placement.
+        assert_eq!(project.pattern(pattern).unwrap().notes.len(), 1);
+        assert_eq!(project.pattern_use_count(pattern), 2);
+        assert_eq!(project.note_count(), 2);
+        assert_eq!(
+            project.track(a).unwrap().clip(first).unwrap().pattern,
+            pattern
+        );
+
+        // Cloning forks the content instead of aliasing it.
+        let clone = project.clone_pattern(pattern).unwrap();
+        project
+            .add_note(clone, 62, 90, Ticks::ZERO, Ticks(240))
+            .unwrap();
+        assert_eq!(project.pattern(pattern).unwrap().notes.len(), 1);
+        assert_eq!(project.pattern(clone).unwrap().notes.len(), 2);
+        assert_eq!(project.pattern_use_count(clone), 0);
+    }
+
+    #[test]
+    fn clip_placement_takes_its_length_from_the_pattern() {
+        let mut project = Project::new("Test");
+        let track = project.add_track("A").unwrap();
+        let pattern = project.add_pattern("Hook", Ticks(1920)).unwrap();
+        let clip = project.add_clip(track, pattern, Ticks(480)).unwrap();
+
+        let placement = project.track(track).unwrap().clip(clip).unwrap();
+        assert_eq!(placement.length, Ticks(1920));
+        assert_eq!(placement.end(), Ticks(2400));
+        assert_eq!(
+            project.add_clip(track, PatternId(999), Ticks::ZERO),
+            Err(ModelError::PatternNotFound(PatternId(999)))
+        );
     }
 }

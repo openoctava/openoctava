@@ -1,4 +1,4 @@
-use octava_core::{ClipId, Preset, Project, Ticks, TrackId};
+use octava_core::{PatternId, Preset, Project, Ticks};
 
 pub fn demo_project() -> Project {
     let mut project = Project::new("Octava Demo");
@@ -10,13 +10,15 @@ pub fn demo_project() -> Project {
     if let Some(track) = project.track_mut(piano) {
         track.preset = Preset::new(0, 0);
     }
-    let piano_clip = project
-        .add_clip(piano, Ticks::ZERO, Ticks::from_quarters(16.0, ppq))
-        .expect("demo clip is valid");
+    let piano_pattern = project
+        .add_pattern("Bell Arpeggio", Ticks::from_quarters(16.0, ppq))
+        .expect("demo pattern is valid");
+    if let Some(pattern) = project.pattern_mut(piano_pattern) {
+        pattern.preset = Preset::new(0, 0);
+    }
     add_notes(
         &mut project,
-        piano,
-        piano_clip,
+        piano_pattern,
         &[
             (0.0, 60, 1.5, 104),
             (1.5, 64, 1.5, 90),
@@ -32,6 +34,10 @@ pub fn demo_project() -> Project {
             (15.0, 67, 1.0, 100),
         ],
     );
+    // Two placements of the same pattern show off the pattern library.
+    project
+        .add_clip(piano, piano_pattern, Ticks::ZERO)
+        .expect("demo clip is valid");
 
     let bass = project
         .add_track("Lately Bass")
@@ -40,13 +46,15 @@ pub fn demo_project() -> Project {
         track.preset = Preset::new(0, 20);
         track.gain = 0.85;
     }
-    let bass_clip = project
-        .add_clip(bass, Ticks::ZERO, Ticks::from_quarters(16.0, ppq))
-        .expect("demo clip is valid");
+    let bass_pattern = project
+        .add_pattern("Bass Line", Ticks::from_quarters(16.0, ppq))
+        .expect("demo pattern is valid");
+    if let Some(pattern) = project.pattern_mut(bass_pattern) {
+        pattern.preset = Preset::new(0, 20);
+    }
     add_notes(
         &mut project,
-        bass,
-        bass_clip,
+        bass_pattern,
         &[
             (0.0, 36, 4.0, 92),
             (4.0, 33, 4.0, 88),
@@ -55,17 +63,19 @@ pub fn demo_project() -> Project {
             (14.0, 31, 2.0, 86),
         ],
     );
+    project
+        .add_clip(bass, bass_pattern, Ticks::ZERO)
+        .expect("demo clip is valid");
 
     project
 }
 
-fn add_notes(project: &mut Project, track: TrackId, clip: ClipId, notes: &[(f64, u8, f64, u8)]) {
+fn add_notes(project: &mut Project, pattern: PatternId, notes: &[(f64, u8, f64, u8)]) {
     let ppq = project.tempo_map.ppq();
     for &(start, key, length, velocity) in notes {
         project
             .add_note(
-                track,
-                clip,
+                pattern,
                 key,
                 velocity,
                 Ticks::from_quarters(start, ppq),

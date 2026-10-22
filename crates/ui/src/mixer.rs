@@ -174,7 +174,7 @@ fn strip(
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!("{} notes", track.note_count()))
+                            RichText::new(format!("{} notes", project.track_note_count(track.id)))
                                 .size(8.5)
                                 .color(theme::TEXT_FAINT),
                         );
@@ -409,7 +409,7 @@ fn clip_span_bars(project: &Project, track: &Track) -> f32 {
     let end = track
         .clips
         .iter()
-        .map(octava_core::MidiClip::end)
+        .map(octava_core::Clip::end)
         .max()
         .unwrap_or_default();
     end.0 as f32 / bar_ticks

@@ -168,7 +168,9 @@ impl OctavaApp {
             let bar = project
                 .time_signature
                 .ticks_per_bar(project.tempo_map.ppq());
-            let _ = project.add_clip(track, Ticks::ZERO, Ticks(bar.saturating_mul(4)));
+            if let Ok(pattern) = project.add_pattern("Clip 1", Ticks(bar.saturating_mul(4))) {
+                let _ = project.add_clip(track, pattern, Ticks::ZERO);
+            }
         }
         self.store = ProjectStore::new(project);
         self.last_audio_revision = self.store.revision();

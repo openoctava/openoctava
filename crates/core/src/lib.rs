@@ -12,7 +12,9 @@ pub mod store;
 pub mod time;
 
 pub use command::{EditCommand, EditOutcome};
-pub use model::{ClipId, MidiClip, ModelError, Note, NoteId, Preset, Project, Track, TrackId};
+pub use model::{
+    Clip, ClipId, ModelError, Note, NoteId, Pattern, PatternId, Preset, Project, Track, TrackId,
+};
 pub use snapshot::{EventKind, PlaybackSnapshot, SnapshotTrack, TimedEvent};
 pub use store::ProjectStore;
 pub use time::{

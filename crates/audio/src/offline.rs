@@ -140,9 +140,10 @@ mod tests {
     fn note_off_on_the_project_boundary_is_delivered() {
         let mut project = Project::new("Boundary");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(1920)).unwrap();
+        let pattern = project.add_pattern("Clip", Ticks(1920)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
         project
-            .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks(1920))
+            .add_note(pattern, 60, 100, Ticks::ZERO, Ticks(1920))
             .unwrap();
 
         let mut renderer = OfflineRenderer::new(44_100).unwrap();

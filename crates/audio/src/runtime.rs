@@ -504,9 +504,10 @@ mod tests {
     fn demo_snapshot() -> Arc<PlaybackSnapshot> {
         let mut project = Project::new("Audio test");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(1920)).unwrap();
+        let pattern = project.add_pattern("Clip", Ticks(1920)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
         project
-            .add_note(track, clip, 60, 110, Ticks::ZERO, Ticks(480))
+            .add_note(pattern, 60, 110, Ticks::ZERO, Ticks(480))
             .unwrap();
         Arc::new(project.compile_snapshot())
     }
@@ -572,9 +573,10 @@ mod tests {
     fn note_off_on_the_last_tick_is_delivered() {
         let mut project = Project::new("Boundary");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(1920)).unwrap();
+        let pattern = project.add_pattern("Clip", Ticks(1920)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
         project
-            .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks(1920))
+            .add_note(pattern, 60, 100, Ticks::ZERO, Ticks(1920))
             .unwrap();
 
         let mut harness = harness();
@@ -600,9 +602,10 @@ mod tests {
     fn snapshot_update_keeps_sounding_notes_and_releases_deleted_ones() {
         let mut project = Project::new("Live edit");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(3840)).unwrap();
+        let pattern = project.add_pattern("Clip", Ticks(3840)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
         project
-            .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks(3840))
+            .add_note(pattern, 60, 100, Ticks::ZERO, Ticks(3840))
             .unwrap();
 
         let mut harness = harness();
@@ -631,7 +634,7 @@ mod tests {
         );
 
         // An edit that deletes the note: the orphaned voice must be released.
-        project.track_mut(track).unwrap().clips[0].notes.clear();
+        project.pattern_mut(pattern).unwrap().notes.clear();
         harness
             .commands
             .push(AudioCommand::SetSnapshot(Arc::new(

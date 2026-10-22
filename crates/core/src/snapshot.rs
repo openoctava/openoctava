@@ -1,4 +1,4 @@
-use crate::model::{ClipId, MidiClip, Note, NoteId, Preset, Project, Track, TrackId};
+use crate::model::{Clip, ClipId, Note, NoteId, Pattern, Preset, Project, Track, TrackId};
 use crate::time::{TempoMap, Ticks};
 
 /// Immutable, playback-ready view of a project.
@@ -76,7 +76,10 @@ impl Project {
             });
 
             for clip in &track.clips {
-                push_clip_events(track, clip, &mut events);
+                let Some(pattern) = self.pattern(clip.pattern) else {
+                    continue;
+                };
+                push_clip_events(track, clip, pattern, &mut events);
             }
         }
 
@@ -101,18 +104,26 @@ impl Project {
     }
 }
 
-fn push_clip_events(track: &Track, clip: &MidiClip, events: &mut Vec<TimedEvent>) {
-    for note in &clip.notes {
-        push_note_events(track, clip, note, events);
+fn push_clip_events(track: &Track, clip: &Clip, pattern: &Pattern, events: &mut Vec<TimedEvent>) {
+    // A placement may be trimmed shorter than the pattern it plays.
+    let limit = clip.length.min(pattern.length);
+    for note in &pattern.notes {
+        push_note_events(track, clip, note, limit, events);
     }
 }
 
-fn push_note_events(track: &Track, clip: &MidiClip, note: &Note, events: &mut Vec<TimedEvent>) {
-    if note.length == Ticks::ZERO || note.start >= clip.length {
+fn push_note_events(
+    track: &Track,
+    clip: &Clip,
+    note: &Note,
+    limit: Ticks,
+    events: &mut Vec<TimedEvent>,
+) {
+    if note.length == Ticks::ZERO || note.start >= limit {
         return;
     }
 
-    let clipped_length = note.start.saturating_add(note.length).min(clip.length);
+    let clipped_length = note.start.saturating_add(note.length).min(limit);
     let length = clipped_length.saturating_sub(note.start);
     if length == Ticks::ZERO {
         return;
@@ -151,16 +162,17 @@ mod tests {
     fn events_are_sorted_and_clipped_to_clip_end() {
         let mut project = Project::new("Test");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks::ZERO, Ticks(1920)).unwrap();
+        let pattern = project.add_pattern("Verse", Ticks(1920)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
 
         project
-            .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks(480))
+            .add_note(pattern, 60, 100, Ticks::ZERO, Ticks(480))
             .unwrap();
         project
-            .add_note(track, clip, 65, 100, Ticks(480), Ticks(960))
+            .add_note(pattern, 65, 100, Ticks(480), Ticks(960))
             .unwrap();
         project
-            .add_note(track, clip, 62, 100, Ticks(960), Ticks(1920))
+            .add_note(pattern, 62, 100, Ticks(960), Ticks(1920))
             .unwrap();
 
         let snapshot = project.compile_snapshot();
@@ -207,13 +219,15 @@ mod tests {
         let mut project = Project::new("Test");
         let piano = project.add_track("Piano").unwrap();
         let bass = project.add_track("Bass").unwrap();
-        let piano_clip = project.add_clip(piano, Ticks::ZERO, Ticks(960)).unwrap();
-        let bass_clip = project.add_clip(bass, Ticks::ZERO, Ticks(960)).unwrap();
+        let piano_pattern = project.add_pattern("Piano part", Ticks(960)).unwrap();
+        let bass_pattern = project.add_pattern("Bass part", Ticks(960)).unwrap();
+        project.add_clip(piano, piano_pattern, Ticks::ZERO).unwrap();
+        project.add_clip(bass, bass_pattern, Ticks::ZERO).unwrap();
         project
-            .add_note(piano, piano_clip, 60, 100, Ticks::ZERO, Ticks(480))
+            .add_note(piano_pattern, 60, 100, Ticks::ZERO, Ticks(480))
             .unwrap();
         project
-            .add_note(bass, bass_clip, 36, 100, Ticks::ZERO, Ticks(480))
+            .add_note(bass_pattern, 36, 100, Ticks::ZERO, Ticks(480))
             .unwrap();
 
         project.track_mut(bass).unwrap().mute = true;
@@ -241,13 +255,60 @@ mod tests {
     fn clip_start_offsets_events() {
         let mut project = Project::new("Test");
         let track = project.add_track("Piano").unwrap();
-        let clip = project.add_clip(track, Ticks(960), Ticks(1920)).unwrap();
+        let pattern = project.add_pattern("Verse", Ticks(1920)).unwrap();
+        project.add_clip(track, pattern, Ticks(960)).unwrap();
         project
-            .add_note(track, clip, 60, 100, Ticks(120), Ticks(240))
+            .add_note(pattern, 60, 100, Ticks(120), Ticks(240))
             .unwrap();
 
         let snapshot = project.compile_snapshot();
         assert_eq!(snapshot.events[0].tick, Ticks(1080));
         assert_eq!(snapshot.events[1].tick, Ticks(1320));
+    }
+
+    #[test]
+    fn trimmed_placement_clips_its_notes() {
+        let mut project = Project::new("Test");
+        let track = project.add_track("Piano").unwrap();
+        let pattern = project.add_pattern("Verse", Ticks(1920)).unwrap();
+        let clip = project.add_clip(track, pattern, Ticks::ZERO).unwrap();
+        project
+            .add_note(pattern, 60, 100, Ticks(960), Ticks(960))
+            .unwrap();
+
+        project
+            .apply(&crate::command::EditCommand::ResizeClip {
+                track,
+                clip,
+                length: Ticks(1200),
+            })
+            .unwrap();
+
+        let snapshot = project.compile_snapshot();
+        assert_eq!(snapshot.events[0].tick, Ticks(960));
+        assert_eq!(snapshot.events[1].tick, Ticks(1200));
+        assert_eq!(snapshot.length, Ticks(1200));
+    }
+
+    #[test]
+    fn every_placement_of_a_pattern_sounds() {
+        let mut project = Project::new("Test");
+        let track = project.add_track("Piano").unwrap();
+        let pattern = project.add_pattern("Hook", Ticks(960)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
+        project.add_clip(track, pattern, Ticks(1920)).unwrap();
+        project
+            .add_note(pattern, 60, 100, Ticks::ZERO, Ticks(480))
+            .unwrap();
+
+        let snapshot = project.compile_snapshot();
+        let onsets: Vec<u64> = snapshot
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::NoteOn { .. }))
+            .map(|event| event.tick.0)
+            .collect();
+        assert_eq!(onsets, vec![0, 1920]);
+        assert_eq!(snapshot.length, Ticks(2880));
     }
 }
