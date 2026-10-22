@@ -151,9 +151,29 @@ impl TempoSegment {
 
 /// Piecewise-constant tempo map. The first segment always starts at tick zero.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(try_from = "TempoMapData")]
 pub struct TempoMap {
     ppq: u16,
     segments: Vec<TempoSegment>,
+}
+
+/// Wire representation of [`TempoMap`], validated before it becomes a map.
+#[derive(Deserialize)]
+struct TempoMapData {
+    ppq: u16,
+    segments: Vec<TempoSegment>,
+}
+
+impl TryFrom<TempoMapData> for TempoMap {
+    type Error = TimeError;
+
+    fn try_from(data: TempoMapData) -> Result<Self, Self::Error> {
+        let map = Self {
+            ppq: data.ppq,
+            segments: data.segments,
+        };
+        map.validate()
+    }
 }
 
 impl Default for TempoMap {
@@ -180,6 +200,42 @@ impl TempoMap {
     #[must_use]
     pub const fn ppq(&self) -> u16 {
         self.ppq
+    }
+
+    /// Checks the invariants the rest of the module relies on. Deserialized
+    /// maps go through this so that a malformed project cannot index an empty
+    /// segment list or divide by a zero PPQ.
+    fn validate(self) -> Result<Self, TimeError> {
+        if self.ppq == 0 {
+            return Err(TimeError::InvalidPpq);
+        }
+        let Some(first) = self.segments.first() else {
+            return Err(TimeError::InvalidTempoMap(
+                "at least one segment is required",
+            ));
+        };
+        if first.start != Ticks::ZERO {
+            return Err(TimeError::InvalidTempoMap(
+                "the first segment must start at tick zero",
+            ));
+        }
+        if self
+            .segments
+            .windows(2)
+            .any(|pair| pair[0].start >= pair[1].start)
+        {
+            return Err(TimeError::InvalidTempoMap(
+                "segments must be strictly increasing",
+            ));
+        }
+        if self
+            .segments
+            .iter()
+            .any(|segment| !is_valid_bpm(segment.bpm))
+        {
+            return Err(TimeError::InvalidTempo);
+        }
+        Ok(self)
     }
 
     #[must_use]
@@ -269,11 +325,15 @@ impl TempoMap {
 }
 
 fn validate_bpm(bpm: f64) -> Result<(), TimeError> {
-    if bpm.is_finite() && bpm > 0.0 {
+    if is_valid_bpm(bpm) {
         Ok(())
     } else {
         Err(TimeError::InvalidTempo)
     }
+}
+
+fn is_valid_bpm(bpm: f64) -> bool {
+    bpm.is_finite() && bpm > 0.0
 }
 
 fn seconds_per_tick(bpm: f64, ppq: u16) -> f64 {
@@ -291,6 +351,8 @@ pub enum TimeError {
     InvalidPpq,
     #[error("tempo must be finite and greater than zero")]
     InvalidTempo,
+    #[error("tempo map is invalid: {0}")]
+    InvalidTempoMap(&'static str),
     #[error(
         "time signature must have a numerator in 1..=64 and a power-of-two denominator in 1..=64"
     )]
@@ -351,6 +413,37 @@ mod tests {
             tempo.insert_tempo(Ticks(0), -1.0),
             Err(TimeError::InvalidTempo)
         );
+    }
+
+    #[test]
+    fn malformed_tempo_maps_are_rejected_on_load() {
+        // The accessors index `segments[0]`, so an empty list used to panic.
+        assert!(serde_json::from_str::<TempoMap>(r#"{"ppq":960,"segments":[]}"#).is_err());
+        assert!(
+            serde_json::from_str::<TempoMap>(r#"{"ppq":0,"segments":[{"start":0,"bpm":120.0}]}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<TempoMap>(
+                r#"{"ppq":960,"segments":[{"start":480,"bpm":120.0}]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<TempoMap>(
+                r#"{"ppq":960,"segments":[{"start":0,"bpm":120.0},{"start":0,"bpm":60.0}]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<TempoMap>(r#"{"ppq":960,"segments":[{"start":0,"bpm":0.0}]}"#)
+                .is_err()
+        );
+
+        let mut tempo = TempoMap::default();
+        tempo.insert_tempo(Ticks(1920), 60.0).unwrap();
+        let json = serde_json::to_string(&tempo).unwrap();
+        assert_eq!(serde_json::from_str::<TempoMap>(&json).unwrap(), tempo);
     }
 
     #[test]

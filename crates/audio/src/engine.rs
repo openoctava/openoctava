@@ -329,6 +329,12 @@ where
 
                     written += block;
                 }
+
+                // `data` is normally an exact number of frames; zero whatever
+                // is left so that a device cannot pick up stale garbage.
+                for sample in &mut data[frames * channels..] {
+                    *sample = T::from_sample(0.0_f32);
+                }
             },
             move |error| eprintln!("octava audio stream error: {error}"),
             None,

@@ -130,3 +130,30 @@ fn push_interleaved(output: &mut Vec<f32>, left: &[f32], right: &[f32]) {
             .flat_map(|(left, right)| [*left, *right]),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octava_core::Project;
+
+    #[test]
+    fn note_off_on_the_project_boundary_is_delivered() {
+        let mut project = Project::new("Boundary");
+        let track = project.add_track("Piano").unwrap();
+        let clip = project.add_clip(track, Ticks::ZERO, Ticks(1920)).unwrap();
+        project
+            .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks(1920))
+            .unwrap();
+
+        let mut renderer = OfflineRenderer::new(44_100).unwrap();
+        renderer
+            .render(Arc::new(project.compile_snapshot()), 0.1)
+            .unwrap();
+
+        assert_eq!(
+            renderer.runtime.held_keys(),
+            0,
+            "the note ending on the last tick was never released"
+        );
+    }
+}

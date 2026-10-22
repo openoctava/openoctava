@@ -29,7 +29,11 @@ pub(crate) struct Runtime {
     preview_channel: u32,
     preview_key: u32,
     preview_released: bool,
+    /// Bitmask of the keys currently held on each channel.
+    active: [u128; 16],
 }
+
+const CHANNELS: usize = 16;
 
 impl Runtime {
     pub(crate) fn new(
@@ -59,6 +63,7 @@ impl Runtime {
             preview_channel: 0,
             preview_key: 0,
             preview_released: true,
+            active: [0; CHANNELS],
         };
         runtime.publish();
         runtime
@@ -104,7 +109,10 @@ impl Runtime {
             let next_event = snapshot.events.get(self.event_index).copied();
             let scheduled = next_event.and_then(|event| {
                 let event_seconds = snapshot.tempo_map.seconds_at(event.tick);
-                if event_seconds < block_end - TICK_EPSILON {
+                // `<=` matters: a note-off that lands exactly on the project
+                // boundary is clamped to `block_end`, and dropping it would
+                // leave the voice sounding through the whole release tail.
+                if event_seconds <= block_end + TICK_EPSILON {
                     let offset = ((event_seconds - self.position_seconds) * self.sample_rate)
                         .round()
                         .max(0.0) as usize;
@@ -163,6 +171,13 @@ impl Runtime {
         self.peak_left = peak(left);
         self.peak_right = peak(right);
         self.publish();
+    }
+
+    /// Number of keys the synthesizer still holds. Every note must have
+    /// received its note-off once playback has finished.
+    #[cfg(test)]
+    pub(crate) fn held_keys(&self) -> u32 {
+        self.active.iter().map(|mask| mask.count_ones()).sum()
     }
 
     fn render_frames(&self, left: &mut [f32], right: &mut [f32]) {
@@ -236,13 +251,19 @@ impl Runtime {
 
     fn replace_snapshot(&mut self, snapshot: Arc<PlaybackSnapshot>) {
         let tick = self.current_tick();
+        let start = tick.min(snapshot.length);
+        let event_index = snapshot.events.partition_point(|event| event.tick < start);
+
         self.clear_preview();
         self.retire_snapshot();
-        self.position_seconds = snapshot.tempo_map.seconds_at(tick.min(snapshot.length));
+        self.position_seconds = snapshot.tempo_map.seconds_at(start);
         self.end_seconds = snapshot.tempo_map.seconds_at(snapshot.length);
-        self.event_index = snapshot.events.partition_point(|event| event.tick < tick);
+        self.event_index = event_index;
         self.snapshot = Some(snapshot);
-        self.reset_synth();
+        // Do not reset the synthesizer: edits are applied while playback
+        // continues, so the voices that are currently sounding must survive.
+        self.sync_channels();
+        self.release_orphaned_voices();
     }
 
     fn retire_snapshot(&mut self) {
@@ -253,8 +274,9 @@ impl Runtime {
         }
     }
 
-    fn reset_synth(&self) {
-        let _ = self.synth.system_reset();
+    /// Applies program, volume and pan for every track of the current
+    /// snapshot without disturbing the voices that are already playing.
+    fn sync_channels(&self) {
         if let Some(snapshot) = &self.snapshot {
             for track in &snapshot.tracks {
                 let channel = u32::from(track.channel.min(15));
@@ -270,6 +292,12 @@ impl Runtime {
                 let _ = self.synth.cc(channel, 10, pan.min(127));
             }
         }
+    }
+
+    fn reset_synth(&mut self) {
+        let _ = self.synth.system_reset();
+        self.active = [0; CHANNELS];
+        self.sync_channels();
     }
 
     fn render_preview(&mut self, left: &mut [f32], right: &mut [f32]) -> usize {
@@ -309,6 +337,7 @@ impl Runtime {
 
         self.clear_preview();
         let channel = u32::from(note.channel.min(15));
+        self.active = [0; CHANNELS];
         let _ = self.synth.system_reset();
         let _ = self.synth.program_select(
             channel,
@@ -338,21 +367,74 @@ impl Runtime {
         self.preview_released = true;
     }
 
-    fn trigger(&self, event: TimedEvent) {
-        let channel = u32::from(event.channel.min(15));
+    fn trigger(&mut self, event: TimedEvent) {
+        // Notes outside the MIDI range cannot be voiced; the model rejects them
+        // but a hand-edited project file may still contain them.
+        let Some(mask) = key_mask(event.kind.key()) else {
+            return;
+        };
+        let channel_index = usize::from(event.channel.min(15));
+        let channel = channel_index as u32;
         match event.kind {
             EventKind::NoteOn { key, velocity } => {
                 let _ = self
                     .synth
                     .note_on(channel, u32::from(key), u32::from(velocity));
+                self.active[channel_index] |= mask;
             }
             EventKind::NoteOff { key } => {
                 let _ = self.synth.note_off(channel, u32::from(key));
+                self.active[channel_index] &= !mask;
             }
         }
     }
 
+    /// Releases voices whose note-off is no longer part of the schedule, e.g.
+    /// because the note was deleted while it was sounding. Notes that still
+    /// have a pending note-off are left alone so that an edit made during
+    /// playback does not cut the current sound.
+    fn release_orphaned_voices(&mut self) {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        if self.active.iter().all(|mask| *mask == 0) {
+            return;
+        }
+
+        let mut orphans = self.active;
+        for event in &snapshot.events[self.event_index..] {
+            if let EventKind::NoteOff { key } = event.kind
+                && let Some(mask) = key_mask(key)
+            {
+                orphans[usize::from(event.channel.min(15))] &= !mask;
+                if orphans.iter().all(|mask| *mask == 0) {
+                    break;
+                }
+            }
+        }
+
+        for (channel, mask) in orphans.iter().enumerate() {
+            let mut mask = *mask;
+            while mask != 0 {
+                let key = mask.trailing_zeros();
+                mask &= mask - 1;
+                let _ = self.synth.note_off(channel as u32, key);
+            }
+        }
+
+        for (active, orphan) in self.active.iter_mut().zip(orphans) {
+            *active &= !orphan;
+        }
+    }
+
     fn finish(&mut self, snapshot: &PlaybackSnapshot) {
+        // The transport stops on the project boundary. Any event still pending
+        // there - in practice the note-offs of notes ending on the last tick -
+        // has to be delivered, otherwise those voices are left sounding.
+        while let Some(event) = snapshot.events.get(self.event_index).copied() {
+            self.trigger(event);
+            self.event_index += 1;
+        }
         self.position_seconds = snapshot.tempo_map.seconds_at(snapshot.length);
         self.state = TransportState::Paused;
     }
@@ -375,6 +457,11 @@ fn peak(samples: &[f32]) -> f32 {
         .iter()
         .fold(0.0_f32, |peak, sample| peak.max(sample.abs()))
         .min(1.0)
+}
+
+/// Bit of `key` inside a channel mask, or `None` for keys outside 0..=127.
+const fn key_mask(key: u8) -> Option<u128> {
+    if key < 128 { Some(1_u128 << key) } else { None }
 }
 
 #[cfg(test)]
@@ -479,6 +566,84 @@ mod tests {
         let (left, right) = harness.telemetry.peaks();
         assert_eq!(left, 0.0);
         assert_eq!(right, 0.0);
+    }
+
+    #[test]
+    fn note_off_on_the_last_tick_is_delivered() {
+        let mut project = Project::new("Boundary");
+        let track = project.add_track("Piano").unwrap();
+        let clip = project.add_clip(track, Ticks::ZERO, Ticks(1920)).unwrap();
+        project
+            .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks(1920))
+            .unwrap();
+
+        let mut harness = harness();
+        harness
+            .commands
+            .push(AudioCommand::Play {
+                snapshot: Arc::new(project.compile_snapshot()),
+                start: Ticks::ZERO,
+            })
+            .unwrap();
+
+        // 1920 ticks at 120 BPM are one second, i.e. ~94 blocks of 512 frames.
+        render(&mut harness.runtime, 120);
+
+        assert_eq!(harness.telemetry.state(), TransportState::Paused);
+        assert!(
+            harness.runtime.active.iter().all(|mask| *mask == 0),
+            "a note ending on the last tick was never released"
+        );
+    }
+
+    #[test]
+    fn snapshot_update_keeps_sounding_notes_and_releases_deleted_ones() {
+        let mut project = Project::new("Live edit");
+        let track = project.add_track("Piano").unwrap();
+        let clip = project.add_clip(track, Ticks::ZERO, Ticks(3840)).unwrap();
+        project
+            .add_note(track, clip, 60, 100, Ticks::ZERO, Ticks(3840))
+            .unwrap();
+
+        let mut harness = harness();
+        harness
+            .commands
+            .push(AudioCommand::Play {
+                snapshot: Arc::new(project.compile_snapshot()),
+                start: Ticks::ZERO,
+            })
+            .unwrap();
+        render(&mut harness.runtime, 4);
+        assert_eq!(harness.runtime.active[0] & (1 << 60), 1 << 60);
+
+        // An edit that keeps the note: it must keep playing.
+        harness
+            .commands
+            .push(AudioCommand::SetSnapshot(Arc::new(
+                project.compile_snapshot(),
+            )))
+            .unwrap();
+        render(&mut harness.runtime, 1);
+        assert_eq!(
+            harness.runtime.active[0] & (1 << 60),
+            1 << 60,
+            "the sounding note was cut by the snapshot update"
+        );
+
+        // An edit that deletes the note: the orphaned voice must be released.
+        project.track_mut(track).unwrap().clips[0].notes.clear();
+        harness
+            .commands
+            .push(AudioCommand::SetSnapshot(Arc::new(
+                project.compile_snapshot(),
+            )))
+            .unwrap();
+        render(&mut harness.runtime, 1);
+        assert_eq!(
+            harness.runtime.active[0] & (1 << 60),
+            0,
+            "deleting a sounding note left its voice hanging"
+        );
     }
 
     #[test]

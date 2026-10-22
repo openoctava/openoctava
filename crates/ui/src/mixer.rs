@@ -266,7 +266,7 @@ fn finish_mixer_drag(project: &Project, state: &mut UiState, actions: &mut Vec<U
     match drag.param {
         MixerParam::Gain => actions.push(track_params(
             drag.track,
-            Some(drag.preview.clamp(0.0, 2.0)),
+            Some(drag.preview.clamp(0.0, 1.0)),
             None,
             None,
             None,
@@ -311,7 +311,7 @@ fn fader(ui: &mut egui::Ui, value: f32, color: Color32) -> (Response, f32) {
         StrokeKind::Inside,
     );
 
-    let normalized = (value.clamp(0.0, 2.0) / 2.0).powf(0.65);
+    let normalized = value.clamp(0.0, 1.0).powf(0.65);
     let y = rail.bottom() - normalized * rail.height();
     painter.rect_filled(
         Rect::from_min_max(rail.min, pos2(rail.right(), y)),
@@ -331,9 +331,7 @@ fn fader(ui: &mut egui::Ui, value: f32, color: Color32) -> (Response, f32) {
         let current = ui
             .data(|data| data.get_temp::<f32>(ui.id().with("fader-value")))
             .unwrap_or(value);
-        let next = (current - pointer_delta / (rail.height() * 0.65) * 2.0)
-            .clamp(0.0, 2.0)
-            .max(0.0);
+        let next = (current - pointer_delta / (rail.height() * 0.65)).clamp(0.0, 1.0);
         ui.data_mut(|data| data.insert_temp(ui.id().with("fader-value"), next));
         next
     } else {

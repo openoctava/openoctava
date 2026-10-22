@@ -107,7 +107,8 @@ pub struct Track {
     /// MIDI channel in `0..=15`.
     pub channel: u8,
     pub preset: Preset,
-    /// Linear gain, `1.0` is unity.
+    /// Linear gain, `1.0` is unity. Values above unity are not supported by
+    /// the current engine, so this is also the maximum.
     pub gain: f32,
     /// Stereo pan in `-1.0..=1.0`.
     pub pan: f32,
@@ -322,7 +323,7 @@ pub(crate) fn validate_key(key: u8) -> Result<(), ModelError> {
     if key <= 127 {
         Ok(())
     } else {
-        Err(ModelError::InvalidKey(key))
+        Err(ModelError::InvalidKey(i32::from(key)))
     }
 }
 
@@ -366,7 +367,7 @@ pub enum ModelError {
     #[error("all 16 MIDI channels are already in use")]
     NoFreeChannel,
     #[error("MIDI key must be in 0..=127, got {0}")]
-    InvalidKey(u8),
+    InvalidKey(i32),
     #[error("MIDI velocity must be in 1..=127, got {0}")]
     InvalidVelocity(u8),
     #[error("clip length must be greater than zero")]
@@ -377,7 +378,7 @@ pub enum ModelError {
     NoteOutsideClip,
     #[error("track name must not be empty")]
     EmptyTrackName,
-    #[error("track gain must be finite and non-negative")]
+    #[error("track gain must be finite and in 0.0..=1.0")]
     InvalidGain,
     #[error("track pan must be in -1.0..=1.0")]
     InvalidPan,

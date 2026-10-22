@@ -151,7 +151,7 @@ pub(crate) fn apply(
             preset,
         } => {
             if let Some(gain) = gain
-                && (!gain.is_finite() || *gain < 0.0)
+                && (!gain.is_finite() || !(0.0..=1.0).contains(gain))
             {
                 return Err(ModelError::InvalidGain);
             }
@@ -267,7 +267,7 @@ pub(crate) fn apply(
                     return Err(ModelError::NoteOutsideClip);
                 }
                 if !(0..=127).contains(&new_key) {
-                    return Err(ModelError::InvalidKey(new_key as u8));
+                    return Err(ModelError::InvalidKey(new_key as i32));
                 }
                 validate_note_geometry(Ticks(new_start as u64), note.length, stored.length)?;
             }
@@ -376,6 +376,67 @@ mod tests {
         let track = project.add_track("Piano").unwrap();
         let clip = project.add_clip(track, Ticks::ZERO, Ticks(3840)).unwrap();
         (ProjectStore::new(project), track, clip)
+    }
+
+    #[test]
+    fn gain_is_capped_at_unity() {
+        let (mut store, track, _clip) = fixture();
+
+        assert!(
+            store
+                .apply(EditCommand::SetTrackParams {
+                    track,
+                    gain: Some(1.5),
+                    pan: None,
+                    mute: None,
+                    solo: None,
+                    preset: None,
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .apply(EditCommand::SetTrackParams {
+                    track,
+                    gain: Some(1.0),
+                    pan: None,
+                    mute: None,
+                    solo: None,
+                    preset: None,
+                })
+                .is_ok()
+        );
+        assert_eq!(store.project().track(track).unwrap().gain, 1.0);
+    }
+
+    #[test]
+    fn out_of_range_key_reports_the_requested_value() {
+        let (mut store, track, clip) = fixture();
+        let note = store
+            .apply(EditCommand::AddNote {
+                track,
+                clip,
+                key: 60,
+                velocity: 100,
+                start: Ticks(0),
+                length: Ticks(480),
+            })
+            .unwrap()
+            .note
+            .unwrap();
+
+        let error = store
+            .apply(EditCommand::MoveNotes {
+                track,
+                clip,
+                notes: vec![note],
+                delta_ticks: 0,
+                delta_key: -120,
+            })
+            .unwrap_err();
+
+        assert_eq!(error, ModelError::InvalidKey(-60));
+        assert!(error.to_string().contains("-60"));
     }
 
     #[test]
