@@ -9,8 +9,7 @@ use crate::theme;
 
 const STRIP_WIDTH: f32 = 132.0;
 const MIN_FADER_HEIGHT: f32 = 84.0;
-/// Height of the header block above the fader and the caption pinned below it.
-const STRIP_HEADER: f32 = 118.0;
+/// Height reserved for the caption pinned below the fader.
 const STRIP_FOOTER: f32 = 18.0;
 
 pub(crate) fn show(
@@ -190,8 +189,7 @@ fn strip(
                 });
 
                 ui.add_space(6.0);
-                let fader_height =
-                    (content_height - STRIP_HEADER - STRIP_FOOTER).max(MIN_FADER_HEIGHT);
+                let fader_height = (ui.available_height() - STRIP_FOOTER).max(MIN_FADER_HEIGHT);
                 ui.horizontal_top(|ui| {
                     let gain = current_value(track.id, MixerParam::Gain, track.gain, state);
                     let (response, new_gain) = fader(ui, gain, color, fader_height);
