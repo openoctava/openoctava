@@ -241,7 +241,7 @@ fn handle_input(
                 // The plain wheel scrolls the pattern horizontally, so that a
                 // mouse without a horizontal axis can still pan the view.
                 let dx = if scroll.y != 0.0 { scroll.y } else { scroll.x };
-                state.piano_roll.left_tick -= f64::from(dx / px_per_tick);
+                state.piano_roll.left_tick += f64::from(dx / px_per_tick);
             }
         }
     }
@@ -262,6 +262,7 @@ fn handle_input(
     {
         actions.push(UiAction::AuditionNote {
             track,
+            preset: pattern.preset,
             key: key_at_y(grid, pointer.y),
             velocity: 100,
         });
@@ -438,6 +439,7 @@ fn update_note_drag(
     {
         actions.push(UiAction::AuditionNote {
             track,
+            preset: pattern.preset,
             key: next.preview_key,
             velocity: 100,
         });

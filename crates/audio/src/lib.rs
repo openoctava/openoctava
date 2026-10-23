@@ -14,3 +14,4 @@ mod soundfont;
 
 pub use engine::{AudioEngine, AudioError, AudioTelemetry, PreviewNote, TransportState};
 pub use offline::OfflineRenderer;
+pub use soundfont::{SoundFontError, SoundFontPreset, default_soundfont_path, list_presets};

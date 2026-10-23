@@ -48,7 +48,8 @@ pub fn render_wav(
     path: impl AsRef<Path>,
     settings: RenderSettings,
 ) -> Result<(), RenderError> {
-    render_snapshot_wav(Arc::new(project.compile_snapshot()), path, settings)
+    let snapshot = Arc::new(project.compile_snapshot());
+    render_snapshot_wav_with(snapshot, path, settings, project.soundfont.as_deref())
 }
 
 /// Writes an already-compiled snapshot as a stereo 16-bit WAV file.
@@ -57,6 +58,15 @@ pub fn render_snapshot_wav(
     path: impl AsRef<Path>,
     settings: RenderSettings,
 ) -> Result<(), RenderError> {
+    render_snapshot_wav_with(snapshot, path, settings, None)
+}
+
+fn render_snapshot_wav_with(
+    snapshot: Arc<PlaybackSnapshot>,
+    path: impl AsRef<Path>,
+    settings: RenderSettings,
+    soundfont: Option<&Path>,
+) -> Result<(), RenderError> {
     if settings.sample_rate == 0 {
         return Err(RenderError::InvalidSampleRate);
     }
@@ -64,7 +74,10 @@ pub fn render_snapshot_wav(
         return Err(RenderError::InvalidTail);
     }
 
-    let mut renderer = OfflineRenderer::new(settings.sample_rate)?;
+    let mut renderer = match soundfont {
+        Some(soundfont) => OfflineRenderer::new_with_soundfont(settings.sample_rate, soundfont)?,
+        None => OfflineRenderer::new(settings.sample_rate)?,
+    };
     let samples = renderer.render(snapshot, settings.tail_seconds)?;
     write_wav(path.as_ref(), &samples, settings.sample_rate)
 }

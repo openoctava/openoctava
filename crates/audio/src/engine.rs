@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -28,6 +28,8 @@ pub enum AudioError {
         #[source]
         source: fluidlite::Error,
     },
+    #[error("sound font '{path}' could not be read: {reason}")]
+    SoundFontRead { path: String, reason: String },
     #[error("unsupported output sample format: {0:?}")]
     UnsupportedSampleFormat(cpal::SampleFormat),
     #[error("audio command queue is full")]
@@ -138,6 +140,7 @@ pub(crate) enum AudioCommand {
     Seek(Ticks),
     SetSnapshot(Arc<PlaybackSnapshot>),
     PreviewNote(PreviewNote),
+    LoadSoundFont(PathBuf),
 }
 
 pub struct AudioEngine {
@@ -257,6 +260,19 @@ impl AudioEngine {
 
     pub fn preview_note(&mut self, note: PreviewNote) -> Result<(), AudioError> {
         self.send(AudioCommand::PreviewNote(note))
+    }
+
+    /// Swaps the SoundFont used by the synthesizer. The file is patched and
+    /// cached on the calling thread; only the load itself happens in the audio
+    /// thread.
+    pub fn set_soundfont(&mut self, path: impl AsRef<Path>) -> Result<(), AudioError> {
+        let path = path.as_ref();
+        soundfont::list_presets(path).map_err(|error| AudioError::SoundFontRead {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })?;
+        let prepared = soundfont::prepare(path);
+        self.send(AudioCommand::LoadSoundFont(prepared))
     }
 
     fn send(&mut self, command: AudioCommand) -> Result<(), AudioError> {

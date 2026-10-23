@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +50,14 @@ pub enum EditCommand {
     SetPatternPreset {
         pattern: PatternId,
         preset: Preset,
+    },
+    SetPatternName {
+        pattern: PatternId,
+        name: String,
+    },
+    /// Switches the project to another SoundFont; `None` restores the bundled one.
+    SetSoundfont {
+        path: Option<PathBuf>,
     },
     /// Places a pattern on a track's timeline.
     AddClip {
@@ -224,6 +233,17 @@ pub(crate) fn apply(
                 .ok_or(ModelError::PatternNotFound(*pattern))?;
             stored.preset = *preset;
             outcome.pattern = Some(*pattern);
+        }
+        EditCommand::SetPatternName { pattern, name } => {
+            validate_pattern_name(name)?;
+            let stored = project
+                .pattern_mut(*pattern)
+                .ok_or(ModelError::PatternNotFound(*pattern))?;
+            stored.name = name.trim().to_owned();
+            outcome.pattern = Some(*pattern);
+        }
+        EditCommand::SetSoundfont { path } => {
+            project.soundfont = path.clone();
         }
         EditCommand::AddClip {
             track,
@@ -817,6 +837,59 @@ mod tests {
 
         assert_eq!(store.project().pattern(pattern).unwrap().notes.len(), 1);
         assert_eq!(store.project().pattern(clone).unwrap().notes.len(), 2);
+    }
+
+    #[test]
+    fn renames_tracks_and_patterns() {
+        let (mut store, track, pattern, _clip) = fixture();
+
+        store
+            .apply(EditCommand::SetTrackName {
+                track,
+                name: "  Lead  ".into(),
+            })
+            .unwrap();
+        assert_eq!(store.project().track(track).unwrap().name, "Lead");
+
+        store
+            .apply(EditCommand::SetPatternName {
+                pattern,
+                name: "Chorus".into(),
+            })
+            .unwrap();
+        assert_eq!(store.project().pattern(pattern).unwrap().name, "Chorus");
+
+        assert!(
+            store
+                .apply(EditCommand::SetPatternName {
+                    pattern,
+                    name: "   ".into(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn soundfont_is_stored_on_the_project() {
+        use std::path::{Path, PathBuf};
+
+        let (mut store, ..) = fixture();
+        assert!(store.project().soundfont.is_none());
+
+        store
+            .apply(EditCommand::SetSoundfont {
+                path: Some(PathBuf::from("/tmp/bank.sf2")),
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().soundfont.as_deref(),
+            Some(Path::new("/tmp/bank.sf2"))
+        );
+
+        store
+            .apply(EditCommand::SetSoundfont { path: None })
+            .unwrap();
+        assert!(store.project().soundfont.is_none());
     }
 
     #[test]

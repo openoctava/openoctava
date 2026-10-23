@@ -43,6 +43,109 @@ pub(crate) fn default_path() -> PathBuf {
     PathBuf::from(DEFAULT_SOUNDFONT)
 }
 
+/// Path of the SoundFont bundled with the application.
+#[must_use]
+pub fn default_soundfont_path() -> PathBuf {
+    default_path()
+}
+
+/// A preset (instrument) exposed by a SoundFont file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoundFontPreset {
+    pub name: String,
+    pub bank: u8,
+    pub program: u8,
+}
+
+/// Why a SoundFont file could not be inspected.
+#[derive(Debug, thiserror::Error)]
+pub enum SoundFontError {
+    #[error("soundfont '{path}' could not be read: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("'{0}' is not a SoundFont file")]
+    NotASoundFont(String),
+}
+
+/// Lists the presets (instruments) contained in a SoundFont file.
+pub fn list_presets(path: &Path) -> Result<Vec<SoundFontPreset>, SoundFontError> {
+    let bytes = fs::read(path).map_err(|source| SoundFontError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    parse_presets(&bytes).ok_or_else(|| SoundFontError::NotASoundFont(path.display().to_string()))
+}
+
+/// Lists the presets of an in-memory SoundFont, or `None` when the bytes are
+/// not a SoundFont.
+fn parse_presets(bytes: &[u8]) -> Option<Vec<SoundFontPreset>> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"sfbk" {
+        return None;
+    }
+
+    let Some((body, end)) = find_chunk(bytes, 12, b"phdr") else {
+        return Some(Vec::new());
+    };
+    let records = &bytes[body..end];
+    let (records, _) = records.as_chunks::<38>();
+    let mut presets = Vec::with_capacity(records.len().saturating_sub(1));
+    for (index, record) in records.iter().enumerate() {
+        // The list is terminated by a sentinel record that must be skipped.
+        if index + 1 == records.len() {
+            break;
+        }
+        let name = preset_name(&record[..20]);
+        if name.is_empty() {
+            continue;
+        }
+        presets.push(SoundFontPreset {
+            name,
+            bank: u16::from_le_bytes([record[22], record[23]]) as u8,
+            program: u16::from_le_bytes([record[20], record[21]]) as u8,
+        });
+    }
+    Some(presets)
+}
+
+fn preset_name(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim().to_owned()
+}
+
+fn find_chunk(bytes: &[u8], start: usize, wanted: &[u8; 4]) -> Option<(usize, usize)> {
+    let mut pos = start;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let body = pos + 8;
+        let end = body.saturating_add(size).min(bytes.len());
+
+        if id == wanted {
+            return Some((body, end));
+        }
+        if id == b"LIST"
+            && end >= body + 4
+            && let Some(found) = find_chunk(bytes, body + 4, wanted)
+        {
+            return Some(found);
+        }
+
+        pos = end + (size & 1);
+    }
+    None
+}
+
 /// Makes a SoundFont safe to play through FluidLite's per-voice panning.
 ///
 /// Some banks hard-pan layers by writing pan generator values outside the
@@ -211,5 +314,50 @@ mod tests {
 
         assert_eq!(changed, 0);
         assert_eq!(bytes, before);
+    }
+
+    fn phdr_record(name: &str, bank: u16, program: u16) -> Vec<u8> {
+        let mut record = vec![0_u8; 38];
+        record[..name.len()].copy_from_slice(name.as_bytes());
+        record[20..22].copy_from_slice(&program.to_le_bytes());
+        record[22..24].copy_from_slice(&bank.to_le_bytes());
+        record
+    }
+
+    #[test]
+    fn bundled_soundfont_lists_presets() {
+        let presets = list_presets(&super::default_path()).unwrap();
+        assert!(presets.len() > 16);
+    }
+
+    #[test]
+    fn lists_presets_and_skips_the_sentinel() {
+        let mut phdr = Vec::new();
+        phdr.extend_from_slice(&phdr_record("Piano", 0, 0));
+        phdr.extend_from_slice(&phdr_record("Choir", 1, 52));
+        // The final record is the end-of-list sentinel.
+        phdr.extend_from_slice(&phdr_record("EOP", 0, 0));
+
+        let mut data = b"pdta".to_vec();
+        data.extend_from_slice(&chunks(&[(b"phdr", phdr)]));
+        let bytes = soundfont(&[(b"LIST", data)]);
+
+        let presets = parse_presets(&bytes).unwrap();
+        assert_eq!(
+            presets,
+            vec![
+                SoundFontPreset {
+                    name: "Piano".to_owned(),
+                    bank: 0,
+                    program: 0,
+                },
+                SoundFontPreset {
+                    name: "Choir".to_owned(),
+                    bank: 1,
+                    program: 52,
+                },
+            ]
+        );
+        assert!(parse_presets(b"not a soundfont").is_none());
     }
 }

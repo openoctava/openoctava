@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use fluidlite::{FontId, Synth};
-use octava_core::{EventKind, PlaybackSnapshot, Ticks, TimedEvent};
+use octava_core::{EventKind, PlaybackSnapshot, Preset, Ticks, TimedEvent};
 use rtrb::{Consumer, Producer};
 
 use crate::engine::{AudioCommand, AudioTelemetry, PreviewNote, TransportState};
@@ -31,6 +31,9 @@ pub(crate) struct Runtime {
     preview_released: bool,
     /// Bitmask of the keys currently held on each channel.
     active: [u128; 16],
+    /// Program currently selected on each channel, so that patterns using a
+    /// different instrument can switch the channel without redundant calls.
+    channel_preset: [Option<Preset>; 16],
 }
 
 const CHANNELS: usize = 16;
@@ -64,6 +67,7 @@ impl Runtime {
             preview_key: 0,
             preview_released: true,
             active: [0; CHANNELS],
+            channel_preset: [None; CHANNELS],
         };
         runtime.publish();
         runtime
@@ -194,6 +198,7 @@ impl Runtime {
                 AudioCommand::Seek(tick) => self.seek(tick),
                 AudioCommand::SetSnapshot(snapshot) => self.replace_snapshot(snapshot),
                 AudioCommand::PreviewNote(note) => self.preview_note(note),
+                AudioCommand::LoadSoundFont(path) => self.load_soundfont(path),
             }
         }
     }
@@ -276,27 +281,39 @@ impl Runtime {
 
     /// Applies program, volume and pan for every track of the current
     /// snapshot without disturbing the voices that are already playing.
-    fn sync_channels(&self) {
-        if let Some(snapshot) = &self.snapshot {
-            for track in &snapshot.tracks {
-                let channel = u32::from(track.channel.min(15));
-                let _ = self.synth.program_select(
-                    channel,
-                    self.font_id,
-                    u32::from(track.preset.bank),
-                    u32::from(track.preset.program),
-                );
-                let volume = (track.gain.clamp(0.0, 1.0) * 127.0).round() as u32;
-                let pan = ((track.pan.clamp(-1.0, 1.0) + 1.0) * 63.5).round() as u32;
-                let _ = self.synth.cc(channel, 7, volume);
-                let _ = self.synth.cc(channel, 10, pan.min(127));
-            }
+    fn sync_channels(&mut self) {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        for track in &snapshot.tracks {
+            let channel_index = usize::from(track.channel.min(15));
+            let channel = channel_index as u32;
+            let _ = self.synth.program_select(
+                channel,
+                self.font_id,
+                u32::from(track.preset.bank),
+                u32::from(track.preset.program),
+            );
+            self.channel_preset[channel_index] = Some(track.preset);
+            let volume = (track.gain.clamp(0.0, 1.0) * 127.0).round() as u32;
+            let pan = ((track.pan.clamp(-1.0, 1.0) + 1.0) * 63.5).round() as u32;
+            let _ = self.synth.cc(channel, 7, volume);
+            let _ = self.synth.cc(channel, 10, pan.min(127));
+        }
+    }
+
+    fn load_soundfont(&mut self, path: std::path::PathBuf) {
+        if let Ok(font_id) = self.synth.sfload(&path, true) {
+            let previous = std::mem::replace(&mut self.font_id, font_id);
+            let _ = self.synth.sfunload(previous, false);
+            self.reset_synth();
         }
     }
 
     fn reset_synth(&mut self) {
         let _ = self.synth.system_reset();
         self.active = [0; CHANNELS];
+        self.channel_preset = [None; CHANNELS];
         self.sync_channels();
     }
 
@@ -345,6 +362,7 @@ impl Runtime {
             u32::from(note.preset.bank),
             u32::from(note.preset.program),
         );
+        self.channel_preset[usize::from(note.channel.min(15))] = Some(note.preset);
         let volume = (note.gain.clamp(0.0, 1.0) * 127.0).round() as u32;
         let pan = ((note.pan.clamp(-1.0, 1.0) + 1.0) * 63.5).round() as u32;
         let _ = self.synth.cc(channel, 7, volume);
@@ -377,6 +395,17 @@ impl Runtime {
         let channel = channel_index as u32;
         match event.kind {
             EventKind::NoteOn { key, velocity } => {
+                // Patterns may name their own instrument; switch the channel
+                // when it differs from what the track selected.
+                if self.channel_preset[channel_index] != Some(event.preset) {
+                    let _ = self.synth.program_select(
+                        channel,
+                        self.font_id,
+                        u32::from(event.preset.bank),
+                        u32::from(event.preset.program),
+                    );
+                    self.channel_preset[channel_index] = Some(event.preset);
+                }
                 let _ = self
                     .synth
                     .note_on(channel, u32::from(key), u32::from(velocity));

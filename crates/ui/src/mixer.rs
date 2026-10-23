@@ -8,7 +8,10 @@ use crate::state::{MixerDrag, MixerParam, PlaybackView, UiAction, UiState};
 use crate::theme;
 
 const STRIP_WIDTH: f32 = 132.0;
-const FADER_HEIGHT: f32 = 86.0;
+const MIN_FADER_HEIGHT: f32 = 84.0;
+/// Height of the header block above the fader and the caption pinned below it.
+const STRIP_HEADER: f32 = 118.0;
+const STRIP_FOOTER: f32 = 18.0;
 
 pub(crate) fn show(
     ui: &mut egui::Ui,
@@ -57,13 +60,15 @@ pub(crate) fn show(
                 return;
             }
 
+            let height = ui.available_height().max(180.0);
             egui::ScrollArea::horizontal()
-                .auto_shrink([false, true])
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    ui.set_min_height(height);
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         for (index, track) in project.tracks.iter().enumerate() {
-                            strip(ui, project, track, index, state, actions);
+                            strip(ui, project, track, index, height, state, actions);
                         }
                     });
                 });
@@ -85,6 +90,7 @@ fn strip(
     project: &Project,
     track: &Track,
     index: usize,
+    height: f32,
     state: &mut UiState,
     actions: &mut Vec<UiAction>,
 ) {
@@ -95,6 +101,7 @@ fn strip(
     } else {
         theme::PANEL
     };
+    let content_height = (height - 12.0).max(140.0);
 
     egui::Frame::NONE
         .fill(fill)
@@ -110,6 +117,7 @@ fn strip(
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.set_width(STRIP_WIDTH);
+            ui.set_height(content_height);
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(vec2(7.0, 7.0), Sense::hover());
@@ -181,10 +189,12 @@ fn strip(
                     });
                 });
 
-                ui.add_space(5.0);
+                ui.add_space(6.0);
+                let fader_height =
+                    (content_height - STRIP_HEADER - STRIP_FOOTER).max(MIN_FADER_HEIGHT);
                 ui.horizontal_top(|ui| {
                     let gain = current_value(track.id, MixerParam::Gain, track.gain, state);
-                    let (response, new_gain) = fader(ui, gain, color);
+                    let (response, new_gain) = fader(ui, gain, color, fader_height);
                     if response.drag_started() {
                         begin_drag(state, track.id, MixerParam::Gain, gain);
                     } else if response.dragged() {
@@ -214,14 +224,15 @@ fn strip(
                                 .size(9.0)
                                 .color(theme::TEXT_DIM),
                         );
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(format!("{:.1} bars", clip_span_bars(project, track)))
-                                .size(8.5)
-                                .color(theme::TEXT_FAINT),
-                        );
                     });
                 });
+
+                ui.add_space((ui.available_height() - STRIP_FOOTER).max(0.0));
+                ui.label(
+                    RichText::new(format!("{:.1} bars", clip_span_bars(project, track)))
+                        .size(8.5)
+                        .color(theme::TEXT_FAINT),
+                );
             });
         });
 }
@@ -298,9 +309,8 @@ fn track_params(
     })
 }
 
-fn fader(ui: &mut egui::Ui, value: f32, color: Color32) -> (Response, f32) {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(24.0, FADER_HEIGHT), Sense::click_and_drag());
+fn fader(ui: &mut egui::Ui, value: f32, color: Color32, height: f32) -> (Response, f32) {
+    let (rect, response) = ui.allocate_exact_size(vec2(24.0, height), Sense::click_and_drag());
     let painter = ui.painter();
     let rail = Rect::from_center_size(rect.center(), vec2(5.0, rect.height() - 8.0));
     painter.rect_filled(rail, CornerRadius::same(2), theme::BACKGROUND);

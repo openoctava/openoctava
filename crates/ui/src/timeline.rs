@@ -6,7 +6,7 @@ use octava_core::{EditCommand, PatternId, Project, Ticks, Track};
 
 use crate::state::{
     ClipDrag, ClipDragKind, ClipRef, ClipboardClip, PatternDragPayload, PendingClip, PlaybackView,
-    TrackDrag, UiAction, UiState,
+    RenameTarget, TrackDrag, UiAction, UiState,
 };
 use crate::theme;
 
@@ -175,6 +175,11 @@ pub(crate) fn show(
             });
         }
         header_response.context_menu(|ui| {
+            if ui.button("Rename Track…").clicked() {
+                state.start_rename(RenameTarget::Track(track.id), &track.name);
+                ui.close();
+            }
+            ui.separator();
             let pattern = target_pattern(project, state);
             if ui
                 .add_enabled(pattern.is_some(), egui::Button::new("Add Clip at Playhead"))
@@ -281,6 +286,9 @@ pub(crate) fn show(
         }
 
         draw_track_header(ui, project, track, header_rect, lanes_clip, selected);
+        if header_rect.top() >= lanes_clip.top() - 0.5 {
+            track_buttons(ui, track, header_rect, actions);
+        }
         draw_track_clips(
             ui,
             project,
@@ -369,6 +377,25 @@ pub(crate) fn show(
         theme::TEXT_FAINT,
     );
 
+    let add_track_rect = Rect::from_min_size(
+        pos2(rect.left() + 52.0, rect.top() + 4.0),
+        vec2(18.0, RULER_HEIGHT - 8.0),
+    );
+    if ui
+        .put(
+            add_track_rect,
+            egui::Button::new(RichText::new("+").size(11.0))
+                .fill(theme::PANEL_RAISED)
+                .corner_radius(2),
+        )
+        .on_hover_text("Add a new track")
+        .clicked()
+    {
+        actions.push(UiAction::Edit(EditCommand::AddTrack {
+            name: format!("Track {}", project.tracks.len() + 1),
+        }));
+    }
+
     if response.clicked()
         && let Some(pointer) = response.interact_pointer_pos()
         && pointer.y < rect.top() + RULER_HEIGHT
@@ -438,7 +465,7 @@ fn handle_view_input(
     } else {
         // The plain wheel pans the arrangement sideways.
         let dx = if scroll.y != 0.0 { scroll.y } else { scroll.x };
-        state.timeline.left_tick -= f64::from(dx) / old_px_per_tick;
+        state.timeline.left_tick += f64::from(dx) / old_px_per_tick;
         let visible_ticks =
             f64::from((response.rect.width() - HEADER_WIDTH).max(1.0)) / old_px_per_tick;
         let max_left = (total_ticks - visible_ticks).max(0.0);
@@ -738,33 +765,54 @@ fn draw_track_header(
         FontId::proportional(9.5),
         theme::TEXT_FAINT,
     );
+}
 
-    let mut badge_x = rect.right() - 10.0;
-    if track.solo {
-        draw_badge(&painter, &mut badge_x, rect.top() + 8.0, "S", theme::ACCENT);
+/// Mute and solo toggles shown on the track header itself.
+fn track_buttons(ui: &mut egui::Ui, track: &Track, header_rect: Rect, actions: &mut Vec<UiAction>) {
+    let size = vec2(20.0, 15.0);
+    let top = header_rect.top() + 5.0;
+    let solo_rect = Rect::from_min_size(pos2(header_rect.right() - 27.0, top), size);
+    let mute_rect = Rect::from_min_size(pos2(header_rect.right() - 50.0, top), size);
+
+    let button = |active: bool, tint: Color32, glyph: &str| {
+        let (fill, color) = if active {
+            (tint, Color32::WHITE)
+        } else {
+            (theme::PANEL_RAISED, theme::TEXT_DIM)
+        };
+        egui::Button::new(RichText::new(glyph).size(9.0).color(color))
+            .fill(fill)
+            .corner_radius(2)
+    };
+
+    if ui
+        .put(
+            mute_rect,
+            button(track.mute, Color32::from_rgb(120, 52, 48), "M"),
+        )
+        .on_hover_text(if track.mute { "Unmute" } else { "Mute" })
+        .clicked()
+    {
+        actions.push(track_params(track.id, Some(!track.mute), None));
     }
-    if track.mute {
-        draw_badge(
-            &painter,
-            &mut badge_x,
-            rect.top() + 8.0,
-            "M",
-            Color32::from_rgb(220, 100, 90),
-        );
+    if ui
+        .put(solo_rect, button(track.solo, theme::ACCENT_SOFT, "S"))
+        .on_hover_text(if track.solo { "Unsolo" } else { "Solo" })
+        .clicked()
+    {
+        actions.push(track_params(track.id, None, Some(!track.solo)));
     }
 }
 
-fn draw_badge(painter: &egui::Painter, x: &mut f32, y: f32, text: &str, color: Color32) {
-    let rect = Rect::from_min_size(pos2(*x - 16.0, y), vec2(16.0, 13.0));
-    painter.rect_filled(rect, CornerRadius::same(2), color.gamma_multiply(0.25));
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        text,
-        FontId::monospace(9.0),
-        color,
-    );
-    *x -= 20.0;
+fn track_params(track: octava_core::TrackId, mute: Option<bool>, solo: Option<bool>) -> UiAction {
+    UiAction::Edit(EditCommand::SetTrackParams {
+        track,
+        gain: None,
+        pan: None,
+        mute,
+        solo,
+        preset: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -862,6 +910,11 @@ fn draw_track_clips(
         let selected = state.selected_clip == Some(selection);
 
         response.context_menu(|ui| {
+            if ui.button("Rename Clip…").clicked() {
+                state.start_rename(RenameTarget::Pattern(clip.pattern), &pattern.name);
+                ui.close();
+            }
+            ui.separator();
             if ui.button("Copy").on_hover_text("Ctrl+C").clicked() {
                 state.clipboard = Some(ClipboardClip {
                     pattern: clip.pattern,

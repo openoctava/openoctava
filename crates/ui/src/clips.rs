@@ -1,42 +1,16 @@
 use egui::{
     Align2, CornerRadius, CursorIcon, FontId, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2,
 };
-use octava_core::{EditCommand, PatternId, Preset, Project};
+use octava_core::{EditCommand, PatternId, Project};
 
-use crate::state::{PatternDragPayload, PlaybackView, UiAction, UiState};
+use crate::soundfont_player::preset_label;
+use crate::state::{PatternDragPayload, RenameTarget, SoundfontView, UiAction, UiState};
 use crate::theme;
-
-/// A small, deliberately incomplete GM program list used by the per-pattern
-/// instrument chooser. The selection is stored on the pattern but is not routed
-/// to the synthesizer yet: a track owns one MIDI channel and therefore one
-/// program.
-pub(crate) const INSTRUMENTS: [(&str, u8); 12] = [
-    ("Acoustic Piano", 0),
-    ("Electric Piano", 4),
-    ("Drawbar Organ", 16),
-    ("Nylon Guitar", 24),
-    ("Electric Bass", 33),
-    ("Strings", 48),
-    ("Choir", 52),
-    ("Brass", 61),
-    ("Alto Sax", 65),
-    ("Square Lead", 80),
-    ("Warm Pad", 89),
-    ("Marimba", 12),
-];
-
-#[must_use]
-pub(crate) fn instrument_name(preset: Preset) -> &'static str {
-    INSTRUMENTS
-        .iter()
-        .find(|(_, program)| *program == preset.program)
-        .map_or("Program", |(name, _)| name)
-}
 
 pub(crate) fn show(
     ui: &mut egui::Ui,
     project: &Project,
-    _playback: &PlaybackView,
+    soundfont: &SoundfontView,
     state: &mut UiState,
     actions: &mut Vec<UiAction>,
 ) {
@@ -100,7 +74,7 @@ pub(crate) fn show(
                             &pattern.name,
                             pattern.notes.len(),
                             pattern.length.0,
-                            pattern.preset,
+                            &preset_label(soundfont, pattern.preset),
                             project.pattern_use_count(pattern.id),
                             bar_ticks,
                             color,
@@ -124,7 +98,7 @@ pub(crate) fn show(
                         });
 
                         response.context_menu(|ui| {
-                            pattern_menu(ui, pattern.id, actions);
+                            pattern_menu(ui, pattern.id, &pattern.name, state, actions);
                         });
 
                         ui.add_space(4.0);
@@ -133,7 +107,17 @@ pub(crate) fn show(
         });
 }
 
-fn pattern_menu(ui: &mut egui::Ui, pattern: PatternId, actions: &mut Vec<UiAction>) {
+fn pattern_menu(
+    ui: &mut egui::Ui,
+    pattern: PatternId,
+    name: &str,
+    state: &mut UiState,
+    actions: &mut Vec<UiAction>,
+) {
+    if ui.button("Rename…").clicked() {
+        state.start_rename(RenameTarget::Pattern(pattern), name);
+        ui.close();
+    }
     if ui
         .button("Clone")
         .on_hover_text("Copy this clip into a new, independent clip")
@@ -144,24 +128,13 @@ fn pattern_menu(ui: &mut egui::Ui, pattern: PatternId, actions: &mut Vec<UiActio
     }
 
     ui.menu_button("Instrument", |ui| {
-        ui.label(
-            RichText::new("Placeholder: not routed to the synth yet")
-                .size(9.0)
-                .color(theme::TEXT_FAINT),
-        );
-        ui.separator();
-        for (name, program) in INSTRUMENTS {
-            if ui
-                .button(name)
-                .on_hover_text(format!("GM program {program}"))
-                .clicked()
-            {
-                actions.push(UiAction::Edit(EditCommand::SetPatternPreset {
-                    pattern,
-                    preset: Preset::new(0, program),
-                }));
-                ui.close();
-            }
+        if ui
+            .add(egui::Button::new("SoundFont Player…").selected(true))
+            .on_hover_text("Choose a SoundFont and one of its sounds")
+            .clicked()
+        {
+            state.soundfont_player = Some(pattern);
+            ui.close();
         }
     });
 
@@ -182,7 +155,7 @@ fn pattern_card(
     name: &str,
     notes: usize,
     length: u64,
-    preset: Preset,
+    preset: &str,
     uses: usize,
     bar_ticks: u64,
     color: egui::Color32,
@@ -244,8 +217,7 @@ fn pattern_card(
         pos2(rect.left() + 10.0, rect.top() + 31.0),
         Align2::LEFT_CENTER,
         format!(
-            "{}  ·  {:.0} bars  ·  {notes} notes  ·  used {uses}×",
-            instrument_name(preset),
+            "{preset}  ·  {:.0} bars  ·  {notes} notes  ·  used {uses}×",
             length as f64 / bar_ticks as f64
         ),
         FontId::proportional(9.0),

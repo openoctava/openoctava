@@ -3,10 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
-use octava_audio::{AudioEngine, PreviewNote, TransportState};
+use octava_audio::{
+    AudioEngine, PreviewNote, SoundFontPreset, TransportState, default_soundfont_path, list_presets,
+};
 use octava_core::{Project, ProjectStore, Ticks};
 use octava_render::{RenderSettings, render_wav};
-use octava_ui::{OctavaUi, PlaybackView, UiAction};
+use octava_ui::{OctavaUi, PlaybackView, SoundfontView, UiAction};
 
 use crate::demo::demo_project;
 
@@ -16,6 +18,9 @@ pub struct OctavaApp {
     ui: OctavaUi,
     store: ProjectStore,
     playback: PlaybackView,
+    soundfont: SoundfontView,
+    /// SoundFont currently loaded into the synthesizer.
+    loaded_soundfont: Option<PathBuf>,
     engine: Option<AudioEngine>,
     last_audio_revision: u64,
     last_error: Option<String>,
@@ -42,16 +47,54 @@ impl OctavaApp {
         };
         let last_audio_revision = store.revision();
 
-        Self {
+        let mut app = Self {
             ui: OctavaUi::new(),
             store,
             playback,
+            soundfont: SoundfontView::default(),
+            loaded_soundfont: None,
             engine,
             last_audio_revision,
             last_error: None,
             notice: None,
             export_open: false,
             export_path: String::new(),
+        };
+        app.refresh_soundfont();
+        app
+    }
+
+    /// Loads the SoundFont requested by the project and refreshes the preset
+    /// list shown in the SoundFont player.
+    fn sync_soundfont(&mut self) {
+        let requested = self.store.project().soundfont.clone();
+        if requested == self.loaded_soundfont {
+            return;
+        }
+
+        let path = requested.clone().unwrap_or_else(default_soundfont_path);
+        self.loaded_soundfont = requested;
+        self.refresh_soundfont();
+        if let Some(engine) = &mut self.engine
+            && let Err(error) = engine.set_soundfont(&path)
+        {
+            self.last_error = Some(error.to_string());
+        }
+    }
+
+    fn refresh_soundfont(&mut self) {
+        let requested = self.loaded_soundfont.clone();
+        let path = requested.clone().unwrap_or_else(default_soundfont_path);
+        self.soundfont.path = requested.map(|path| path.display().to_string());
+        match list_presets(&path) {
+            Ok(presets) => {
+                self.soundfont.presets = presets.into_iter().map(ui_preset).collect();
+                self.soundfont.error = None;
+            }
+            Err(error) => {
+                self.soundfont.presets.clear();
+                self.soundfont.error = Some(error.to_string());
+            }
         }
     }
 
@@ -121,6 +164,7 @@ impl OctavaApp {
             UiAction::NewProject => self.new_project(ctx),
             UiAction::AuditionNote {
                 track,
+                preset,
                 key,
                 velocity,
             } => {
@@ -132,7 +176,7 @@ impl OctavaApp {
                 };
                 let preview = PreviewNote {
                     channel: track.channel,
-                    preset: track.preset,
+                    preset,
                     gain: track.gain,
                     pan: track.pan,
                     key,
@@ -302,6 +346,14 @@ impl OctavaApp {
     }
 }
 
+fn ui_preset(preset: SoundFontPreset) -> octava_ui::SoundfontPreset {
+    octava_ui::SoundfontPreset {
+        name: preset.name,
+        bank: preset.bank,
+        program: preset.program,
+    }
+}
+
 impl eframe::App for OctavaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -309,10 +361,14 @@ impl eframe::App for OctavaApp {
         self.handle_shortcuts(&ctx);
         self.sync_audio_snapshot();
 
-        let actions = self.ui.show(ui, self.store.project(), &self.playback);
+        self.sync_soundfont();
+        let actions = self
+            .ui
+            .show(ui, self.store.project(), &self.playback, &self.soundfont);
         for action in actions {
             self.handle_action(&ctx, action);
         }
+        self.sync_soundfont();
         self.sync_audio_snapshot();
 
         if self.engine.is_none() {

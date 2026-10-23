@@ -1,5 +1,7 @@
+use std::path::PathBuf;
+
 use egui::Pos2;
-use octava_core::{ClipId, EditCommand, NoteId, PatternId, Project, Ticks, Track, TrackId};
+use octava_core::{ClipId, EditCommand, NoteId, PatternId, Preset, Project, Ticks, TrackId};
 
 /// Read-only transport state supplied by the application layer.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -9,6 +11,33 @@ pub struct PlaybackView {
     pub peak_left: f32,
     pub peak_right: f32,
     pub audio_sample_rate: Option<u32>,
+}
+
+/// One instrument exposed by the loaded SoundFont.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoundfontPreset {
+    pub name: String,
+    pub bank: u8,
+    pub program: u8,
+}
+
+/// SoundFont information supplied by the application layer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SoundfontView {
+    /// Path of the loaded SoundFont, `None` when the bundled bank is used.
+    pub path: Option<String>,
+    pub presets: Vec<SoundfontPreset>,
+    pub error: Option<String>,
+}
+
+impl SoundfontView {
+    #[must_use]
+    pub fn preset_name(&self, preset: Preset) -> Option<&str> {
+        self.presets
+            .iter()
+            .find(|candidate| candidate.bank == preset.bank && candidate.program == preset.program)
+            .map(|candidate| candidate.name.as_str())
+    }
 }
 
 /// Everything the UI wants the application layer to do.
@@ -25,6 +54,7 @@ pub enum UiAction {
     ExportWav,
     AuditionNote {
         track: TrackId,
+        preset: Preset,
         key: u8,
         velocity: u8,
     },
@@ -210,6 +240,45 @@ pub(crate) struct TempoDrag {
     pub bpm: f64,
 }
 
+/// Object a rename dialog is editing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenameTarget {
+    Track(TrackId),
+    Pattern(PatternId),
+}
+
+impl UiState {
+    pub(crate) fn start_rename(&mut self, target: RenameTarget, current: &str) {
+        self.rename = Some(RenameState {
+            target,
+            text: current.to_owned(),
+            focus: true,
+        });
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RenameState {
+    pub target: RenameTarget,
+    pub text: String,
+    /// Set for the first frame so that the text field grabs the keyboard.
+    pub focus: bool,
+}
+
+/// Entry of the built-in SoundFont file browser.
+#[derive(Clone, Debug)]
+pub(crate) enum PickerEntry {
+    Directory(PathBuf),
+    Soundfont(PathBuf),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SoundfontPicker {
+    pub directory: PathBuf,
+    pub entries: Vec<PickerEntry>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PianoRollState {
     pub px_per_beat: f32,
@@ -267,6 +336,10 @@ pub(crate) struct UiState {
     pub track_drag: Option<TrackDrag>,
     pub mixer_drag: Option<MixerDrag>,
     pub focus_piano_roll: bool,
+    /// Pattern whose SoundFont player window is open.
+    pub soundfont_player: Option<PatternId>,
+    pub soundfont_picker: Option<SoundfontPicker>,
+    pub rename: Option<RenameState>,
 }
 
 impl UiState {
@@ -413,14 +486,5 @@ impl UiState {
             self.selected_note = None;
         }
         self.selected_pattern = Some(pattern);
-    }
-
-    pub fn selected_track<'a>(&self, project: &'a Project) -> Option<&'a Track> {
-        self.selected_track.and_then(|id| project.track(id))
-    }
-
-    pub fn selected_clip<'a>(&self, project: &'a Project) -> Option<&'a octava_core::Clip> {
-        let selection = self.selected_clip?;
-        project.track(selection.track)?.clip(selection.clip)
     }
 }

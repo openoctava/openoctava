@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::time::{TempoMap, Ticks, TimeError, TimeSignature};
@@ -185,6 +187,10 @@ pub struct Project {
     pub name: String,
     pub tempo_map: TempoMap,
     pub time_signature: TimeSignature,
+    /// SoundFont used by every instrument in the project. `None` plays the
+    /// bundled bank.
+    #[serde(default)]
+    pub soundfont: Option<PathBuf>,
     pub tracks: Vec<Track>,
     /// Reusable patterns. Clips on the timeline reference these by id.
     #[serde(default)]
@@ -212,6 +218,7 @@ impl Project {
             name: name.into(),
             tempo_map: TempoMap::default(),
             time_signature: TimeSignature::default(),
+            soundfont: None,
             tracks: Vec::new(),
             patterns: Vec::new(),
             next_track_id: 1,

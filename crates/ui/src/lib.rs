@@ -4,9 +4,9 @@
 //! widgets and emits [`UiAction`] values for the application layer to execute.
 
 mod clips;
-mod inspector;
 mod mixer;
 mod piano_roll;
+mod soundfont_player;
 mod state;
 mod theme;
 mod timeline;
@@ -18,8 +18,8 @@ use egui::{
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 use octava_core::{EditCommand, Project, Ticks};
 
-use state::UiState;
-pub use state::{PlaybackView, UiAction};
+pub use state::{PlaybackView, SoundfontPreset, SoundfontView, UiAction};
+use state::{RenameTarget, UiState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
@@ -27,7 +27,6 @@ enum Tab {
     Timeline,
     PianoRoll,
     Mixer,
-    Inspector,
 }
 
 impl Tab {
@@ -37,7 +36,6 @@ impl Tab {
             Self::Timeline => "Timeline",
             Self::PianoRoll => "Piano Roll",
             Self::Mixer => "Mixer",
-            Self::Inspector => "Inspector",
         }
     }
 }
@@ -63,12 +61,9 @@ impl OctavaUi {
         let [timeline, _clips] =
             dock.main_surface_mut()
                 .split_left(NodeIndex::root(), 0.18, vec![Tab::Clips]);
-        let [timeline, _inspector] =
-            dock.main_surface_mut()
-                .split_right(timeline, 0.76, vec![Tab::Inspector]);
         let _ =
             dock.main_surface_mut()
-                .split_below(timeline, 0.66, vec![Tab::PianoRoll, Tab::Mixer]);
+                .split_below(timeline, 0.62, vec![Tab::PianoRoll, Tab::Mixer]);
 
         Self {
             dock,
@@ -87,11 +82,12 @@ impl OctavaUi {
         ui: &mut egui::Ui,
         project: &Project,
         playback: &PlaybackView,
+        soundfont: &SoundfontView,
     ) -> Vec<UiAction> {
         self.state.ensure_valid_selection(project);
         let mut actions = Vec::new();
 
-        self.title_bar(ui, project, playback, &mut actions);
+        self.title_bar(ui, project, playback, soundfont, &mut actions);
         transport_bar(ui, project, playback, &mut self.state, &mut actions);
         status_bar(ui, project, playback);
 
@@ -103,6 +99,7 @@ impl OctavaUi {
         let mut viewer = WorkspaceViewer {
             project,
             playback,
+            soundfont,
             state,
             actions: &mut actions,
         };
@@ -139,6 +136,9 @@ impl OctavaUi {
             about_window(ui.ctx(), show_about);
         }
 
+        soundfont_player::show(ui.ctx(), project, soundfont, &mut self.state, &mut actions);
+        rename_window(ui.ctx(), &mut self.state, &mut actions);
+
         actions
     }
 
@@ -147,6 +147,7 @@ impl OctavaUi {
         ui: &mut egui::Ui,
         project: &Project,
         playback: &PlaybackView,
+        soundfont: &SoundfontView,
         actions: &mut Vec<UiAction>,
     ) {
         let mut show_about = false;
@@ -274,10 +275,6 @@ impl OctavaUi {
                             focus_tab = Some(Tab::Mixer);
                             ui.close();
                         }
-                        if ui.button("Inspector").clicked() {
-                            focus_tab = Some(Tab::Inspector);
-                            ui.close();
-                        }
                         ui.separator();
                         if ui.button("Reset Layout").clicked() {
                             reset_layout = true;
@@ -299,8 +296,18 @@ impl OctavaUi {
                             |rate| format!("Audio engine: {rate} Hz"),
                         );
                         ui.label(RichText::new(status).size(11.0).color(theme::TEXT_DIM));
+                        let soundfont_label = soundfont.path.as_deref().map_or_else(
+                            || "SoundFont: bundled bank".to_owned(),
+                            |path| {
+                                let name = std::path::Path::new(path).file_name().map_or_else(
+                                    || path.to_owned(),
+                                    |name| name.to_string_lossy().into_owned(),
+                                );
+                                format!("SoundFont: {name}")
+                            },
+                        );
                         ui.label(
-                            RichText::new("SoundFont: Vintage Dreams Waves v2")
+                            RichText::new(soundfont_label)
                                 .size(10.5)
                                 .color(theme::TEXT_FAINT),
                         );
@@ -420,9 +427,76 @@ fn about_window(ctx: &egui::Context, open: &mut bool) {
         });
 }
 
+fn rename_window(ctx: &egui::Context, state: &mut UiState, actions: &mut Vec<UiAction>) {
+    let Some(rename) = state.rename.as_mut() else {
+        return;
+    };
+    let title = match rename.target {
+        RenameTarget::Track(_) => "Rename Track",
+        RenameTarget::Pattern(_) => "Rename Clip",
+    };
+    let mut open = true;
+    let mut submit = false;
+    let mut cancel = false;
+
+    egui::Window::new(title)
+        .id(egui::Id::new("octava-rename"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ctx, |ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut rename.text)
+                    .desired_width(240.0)
+                    .hint_text("Name"),
+            );
+            if rename.focus {
+                response.request_focus();
+                rename.focus = false;
+            }
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!rename.text.trim().is_empty(), egui::Button::new("Rename"))
+                    .clicked()
+                {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    let target = rename.target;
+    let text = rename.text.trim().to_owned();
+    if submit && !text.is_empty() {
+        actions.push(match target {
+            RenameTarget::Track(track) => {
+                UiAction::Edit(EditCommand::SetTrackName { track, name: text })
+            }
+            RenameTarget::Pattern(pattern) => UiAction::Edit(EditCommand::SetPatternName {
+                pattern,
+                name: text,
+            }),
+        });
+        state.rename = None;
+    } else if cancel || !open {
+        state.rename = None;
+    }
+}
+
 struct WorkspaceViewer<'a> {
     project: &'a Project,
     playback: &'a PlaybackView,
+    soundfont: &'a SoundfontView,
     state: &'a mut UiState,
     actions: &'a mut Vec<UiAction>,
 }
@@ -437,7 +511,7 @@ impl TabViewer for WorkspaceViewer<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
             Tab::Clips => {
-                clips::show(ui, self.project, self.playback, self.state, self.actions);
+                clips::show(ui, self.project, self.soundfont, self.state, self.actions);
             }
             Tab::Timeline => {
                 timeline::show(ui, self.project, self.playback, self.state, self.actions)
@@ -447,9 +521,6 @@ impl TabViewer for WorkspaceViewer<'_> {
             }
             Tab::Mixer => {
                 mixer::show(ui, self.project, self.playback, self.state, self.actions);
-            }
-            Tab::Inspector => {
-                inspector::show(ui, self.project, self.state, self.actions);
             }
         }
     }

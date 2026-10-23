@@ -28,6 +28,9 @@ pub struct TimedEvent {
     pub tick: Ticks,
     pub track: TrackId,
     pub channel: u8,
+    /// Preset of the pattern this note belongs to, so the synthesizer can
+    /// switch sounds per pattern instead of per track.
+    pub preset: Preset,
     pub clip: ClipId,
     pub note: NoteId,
     pub kind: EventKind,
@@ -108,13 +111,14 @@ fn push_clip_events(track: &Track, clip: &Clip, pattern: &Pattern, events: &mut 
     // A placement may be trimmed shorter than the pattern it plays.
     let limit = clip.length.min(pattern.length);
     for note in &pattern.notes {
-        push_note_events(track, clip, note, limit, events);
+        push_note_events(track, clip, pattern, note, limit, events);
     }
 }
 
 fn push_note_events(
     track: &Track,
     clip: &Clip,
+    pattern: &Pattern,
     note: &Note,
     limit: Ticks,
     events: &mut Vec<TimedEvent>,
@@ -136,6 +140,7 @@ fn push_note_events(
         tick: start,
         track: track.id,
         channel: track.channel,
+        preset: pattern.preset,
         clip: clip.id,
         note: note.id,
         kind: EventKind::NoteOn {
@@ -147,6 +152,7 @@ fn push_note_events(
         tick: end,
         track: track.id,
         channel: track.channel,
+        preset: pattern.preset,
         clip: clip.id,
         note: note.id,
         kind: EventKind::NoteOff { key: note.key },
