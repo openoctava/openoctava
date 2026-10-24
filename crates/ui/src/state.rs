@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use egui::Pos2;
 use octava_core::{ClipId, EditCommand, NoteId, PatternId, Preset, Project, Ticks, TrackId};
 
@@ -52,6 +50,8 @@ pub enum UiAction {
     Redo,
     NewProject,
     ExportWav,
+    /// Ask the app shell to open the desktop's native SoundFont picker.
+    ChooseSoundfont,
     AuditionNote {
         track: TrackId,
         preset: Preset,
@@ -265,20 +265,6 @@ pub(crate) struct RenameState {
     pub focus: bool,
 }
 
-/// Entry of the built-in SoundFont file browser.
-#[derive(Clone, Debug)]
-pub(crate) enum PickerEntry {
-    Directory(PathBuf),
-    Soundfont(PathBuf),
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SoundfontPicker {
-    pub directory: PathBuf,
-    pub entries: Vec<PickerEntry>,
-    pub error: Option<String>,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct PianoRollState {
     pub px_per_beat: f32,
@@ -338,7 +324,6 @@ pub(crate) struct UiState {
     pub focus_piano_roll: bool,
     /// Pattern whose SoundFont player window is open.
     pub soundfont_player: Option<PatternId>,
-    pub soundfont_picker: Option<SoundfontPicker>,
     pub rename: Option<RenameState>,
 }
 

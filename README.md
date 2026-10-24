@@ -58,6 +58,8 @@ The demo uses `assets/soundfonts/VintageDreamsWaves-v2.sf2`, a freeware SoundFon
 
 You can point OpenOctava at another SoundFont by setting `OCTAVA_SF2` to its path. Without a SoundFont the application still starts and falls back to the UI preview transport.
 
+To pick a SoundFont from the app, open `Instrument → SoundFont Player…` on a clip and press `Choose…`. That opens the desktop's native file picker (through the XDG desktop portal) and stores the choice on the project; the bundled bank can be restored from the same window.
+
 ## Keyboard shortcuts
 
 - `Space` - play / pause

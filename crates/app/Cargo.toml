@@ -21,3 +21,5 @@ octava-render.workspace = true
 octava-ui.workspace = true
 egui.workspace = true
 eframe.workspace = true
+rfd.workspace = true
+tokio.workspace = true

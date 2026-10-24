@@ -6,7 +6,7 @@ use eframe::egui;
 use octava_audio::{
     AudioEngine, PreviewNote, SoundFontPreset, TransportState, default_soundfont_path, list_presets,
 };
-use octava_core::{Project, ProjectStore, Ticks};
+use octava_core::{EditCommand, Project, ProjectStore, Ticks};
 use octava_render::{RenderSettings, render_wav};
 use octava_ui::{OctavaUi, PlaybackView, SoundfontView, UiAction};
 
@@ -193,6 +193,45 @@ impl OctavaApp {
                 self.export_open = true;
                 self.export_path = default_export_path(self.store.project());
             }
+            UiAction::ChooseSoundfont => self.choose_soundfont(),
+        }
+    }
+
+    /// Opens the desktop's native file picker for SoundFonts.
+    fn choose_soundfont(&mut self) {
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_title("Choose a SoundFont")
+            .add_filter("SoundFont", &["sf2", "sf3"]);
+        if let Some(directory) = self
+            .store
+            .project()
+            .soundfont
+            .as_deref()
+            .and_then(|path| path.parent())
+        {
+            dialog = dialog.set_directory(directory);
+        }
+
+        // The portal backend runs on zbus, which spawns tasks on a Tokio
+        // runtime. rfd's blocking helper polls the future without one, so
+        // drive the async dialog from a runtime we own instead.
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return;
+            }
+        };
+        let Some(file) = runtime.block_on(dialog.pick_file()) else {
+            return;
+        };
+        if let Err(error) = self.store.apply(EditCommand::SetSoundfont {
+            path: Some(file.path().to_path_buf()),
+        }) {
+            self.last_error = Some(error.to_string());
         }
     }
 

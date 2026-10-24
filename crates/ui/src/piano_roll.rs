@@ -490,8 +490,11 @@ fn delete_selected_note(state: &mut UiState, actions: &mut Vec<UiAction>) {
 }
 
 fn key_at_y(grid: &Grid, y: f32) -> u8 {
-    let key = 127.0 - (y - grid.rect.top() + grid.scroll_y) / grid.key_height;
-    key.floor().clamp(0.0, 127.0) as u8
+    // `key_y` puts key 127 at the top of the grid, so the row index counts
+    // down from the top. Floor the row offset before mirroring it: flooring
+    // after mirroring would report the next row down instead of this one.
+    let row = ((y - grid.rect.top() + grid.scroll_y) / grid.key_height).floor();
+    (127.0 - row).clamp(0.0, 127.0) as u8
 }
 
 /// The note that a click at `pointer` would create, after snapping.
@@ -1113,4 +1116,46 @@ fn draw_pending_note(
         Stroke::new(1.0, color.gamma_multiply(0.75)),
         StrokeKind::Inside,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_grid() -> Grid {
+        Grid {
+            rect: Rect::from_min_max(pos2(58.0, 24.0), pos2(858.0, 524.0)),
+            left_tick: 0.0,
+            px_per_tick: 0.5,
+            scroll_y: 140.0,
+            key_height: 14.0,
+        }
+    }
+
+    #[test]
+    fn key_at_y_reports_the_row_under_the_cursor() {
+        let grid = test_grid();
+        for key in 0..=127u8 {
+            let top = grid.key_y(key);
+            let bottom = top + grid.key_height;
+            if bottom <= grid.rect.top() || top >= grid.rect.bottom() {
+                continue;
+            }
+            let y = (top.max(grid.rect.top()) + bottom.min(grid.rect.bottom())) * 0.5;
+            assert_eq!(key_at_y(&grid, y), key, "row for key {key} at y {y}");
+        }
+    }
+
+    #[test]
+    fn key_at_y_uses_the_top_edge_of_the_row() {
+        let grid = test_grid();
+        // A click exactly on the boundary belongs to the row that starts there.
+        let key = 100u8;
+        assert_eq!(key_at_y(&grid, grid.key_y(key)), key);
+        assert_eq!(key_at_y(&grid, grid.key_y(key) + 0.1), key);
+        assert_eq!(
+            key_at_y(&grid, grid.key_y(key) + grid.key_height - 0.1),
+            key
+        );
+    }
 }

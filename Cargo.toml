@@ -26,6 +26,13 @@ cpal = "0.18"
 fluidlite = { version = "0.2", features = ["builtin"] }
 rtrb = "0.4"
 hound = "3"
+# Native file dialogs through the desktop portal: no GTK build dependency and
+# the same dialog the rest of the desktop uses on Wayland and X11.
+rfd = { version = "0.14", default-features = false, features = [
+    "xdg-portal",
+    "tokio",
+] }
+tokio = { version = "1", features = ["rt"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
