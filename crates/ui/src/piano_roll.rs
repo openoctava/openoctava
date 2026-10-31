@@ -1,11 +1,14 @@
+use std::collections::HashMap;
+
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, Response, RichText, Sense, Stroke,
     StrokeKind, Vec2, pos2, vec2,
 };
-use octava_core::{EditCommand, Pattern, Project, Ticks, TrackId};
+use octava_core::{EditCommand, NoteId, Pattern, Project, Ticks, TrackId};
 
 use crate::state::{
-    NoteDrag, NoteDragKind, NoteRef, PlaybackView, SnapDivision, SnapSettings, UiAction, UiState,
+    BoxSelect, NoteDrag, NoteDragKind, NoteDragSnapshot, NoteRef, PlaybackView, SnapDivision,
+    SnapSettings, UiAction, UiState,
 };
 use crate::theme;
 
@@ -78,6 +81,7 @@ pub(crate) fn show(
     draw_grid_lines(ui, project, &grid, rect, state.snap);
     draw_notes(ui, &grid, pattern, pattern_index, state);
     draw_pending_note(ui, project, pattern, pattern_index, &grid, state);
+    draw_marquee(ui, &grid, state);
     draw_ruler(ui, project, &grid, rect);
 
     if pattern.notes.is_empty() {
@@ -100,12 +104,13 @@ pub(crate) fn show(
     ui.painter_at(rect).text(
         pos2(rect.right() - 8.0, rect.bottom() - 6.0),
         Align2::RIGHT_BOTTOM,
-        "click: add note  ·  drag: move/audition  ·  drag edge: resize  ·  right-click: delete  ·  wheel: scroll  ·  Shift+wheel: keys  ·  Ctrl+wheel: zoom",
+        "click: add note  ·  Shift+click: select  ·  Ctrl+drag: box select  ·  drag: move  ·  drag edge: resize  ·  right-click/Del: delete",
         FontId::proportional(9.5),
         theme::TEXT_FAINT,
     );
 
     if ui.input(|input| input.pointer.any_released()) {
+        state.box_select = None;
         finish_note_drag(state, actions);
     }
 }
@@ -150,15 +155,17 @@ fn toolbar(ui: &mut egui::Ui, state: &mut UiState, actions: &mut Vec<UiAction>) 
                     });
 
                 ui.separator();
+                let has_selected_notes =
+                    !state.selected_notes.is_empty() || state.selected_note.is_some();
                 let eraser = tool_icon_button(
                     ui,
                     ToolIcon::Eraser,
                     false,
-                    state.selected_note.is_some(),
-                    "Delete the selected note",
+                    has_selected_notes,
+                    "Delete selected notes",
                 );
                 if eraser.clicked() {
-                    delete_selected_note(state, actions);
+                    delete_selected_notes(state, actions);
                 }
                 tool_icon_button(
                     ui,
@@ -204,6 +211,9 @@ fn handle_input(
         .ticks_per_bar(project.tempo_map.ppq()) as f64;
     let max_left = (pattern.length.0 as f64).max(bar_ticks * 16.0) + bar_ticks * 16.0;
 
+    let is_ctrl = ui.input(|input| input.modifiers.command || input.modifiers.ctrl);
+    let is_shift = ui.input(|input| input.modifiers.shift);
+
     if response.hovered() {
         let (scroll, zoom, shift, pointer) = ui.input(|input| {
             (
@@ -230,7 +240,7 @@ fn handle_input(
             state.piano_roll.px_per_beat = new_px_per_beat;
         }
 
-        if scroll != Vec2::ZERO {
+        if scroll != Vec2::ZERO && !is_ctrl {
             let px_per_tick = (f64::from(state.piano_roll.px_per_beat)
                 / f64::from(project.tempo_map.ppq())) as f32;
             if shift {
@@ -251,6 +261,7 @@ fn handle_input(
 
     if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
         state.note_drag = None;
+        state.box_select = None;
     }
 
     if ui.input(|input| input.pointer.primary_pressed())
@@ -268,7 +279,61 @@ fn handle_input(
         });
     }
 
-    if response.drag_started()
+    // Box selection with Ctrl + drag
+    if is_ctrl
+        && response.drag_started()
+        && let Some(origin) = ui.input(|input| input.pointer.press_origin())
+        && grid.rect.contains(origin)
+    {
+        let initial_selected = if is_shift {
+            state.selected_notes.clone()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        state.box_select = Some(BoxSelect {
+            start: origin,
+            current: origin,
+            initial_selected,
+        });
+        if !is_shift {
+            state.deselect_all_notes();
+        }
+    }
+
+    if let Some(ref mut box_sel) = state.box_select
+        && let Some(pointer) = ui.input(|input| input.pointer.latest_pos())
+    {
+        box_sel.current = pointer;
+        let min_x = box_sel.start.x.min(box_sel.current.x);
+        let max_x = box_sel.start.x.max(box_sel.current.x);
+        let min_y = box_sel.start.y.min(box_sel.current.y);
+        let max_y = box_sel.start.y.max(box_sel.current.y);
+        let sel_rect = Rect::from_min_max(pos2(min_x, min_y), pos2(max_x, max_y));
+
+        let mut new_selection = box_sel.initial_selected.clone();
+        for note in &pattern.notes {
+            let length = note
+                .length
+                .0
+                .min(pattern.length.0.saturating_sub(note.start.0));
+            if length == 0 {
+                continue;
+            }
+            let note_rect = note_screen_rect(grid, note.start.0, length, note.key);
+            if sel_rect.intersects(note_rect) {
+                new_selection.insert(NoteRef {
+                    pattern: pattern.id,
+                    note: note.id,
+                });
+            }
+        }
+        state.selected_notes = new_selection;
+        state.selected_note = state.selected_notes.iter().copied().next();
+    }
+
+    // Note drag start (when not doing box select)
+    if !is_ctrl
+        && response.drag_started()
         && let Some(origin) = ui.input(|input| input.pointer.press_origin())
         && grid.rect.contains(origin)
         && let Some(hit) = hit_test_note(pattern, grid, origin)
@@ -280,7 +345,42 @@ fn handle_input(
             NoteDragKind::Move
         };
         state.select_pattern(hit.note.pattern);
-        state.selected_note = Some(hit.note);
+        if is_shift {
+            state.selected_notes.insert(hit.note);
+            state.selected_note = Some(hit.note);
+        } else if !state.is_note_selected(&hit.note) {
+            state.deselect_all_notes();
+            state.select_note(hit.note, false);
+        }
+
+        let mut note_snapshots = Vec::new();
+        for selected_ref in &state.selected_notes {
+            if selected_ref.pattern == pattern.id
+                && let Some(n) = pattern.note(selected_ref.note)
+            {
+                note_snapshots.push(NoteDragSnapshot {
+                    note: *selected_ref,
+                    original_start: n.start,
+                    original_length: n.length,
+                    original_key: n.key,
+                    preview_start: n.start,
+                    preview_length: n.length,
+                    preview_key: n.key,
+                });
+            }
+        }
+        if note_snapshots.is_empty() {
+            note_snapshots.push(NoteDragSnapshot {
+                note: hit.note,
+                original_start: Ticks(hit.start),
+                original_length: Ticks(hit.length),
+                original_key: hit.key,
+                preview_start: Ticks(hit.start),
+                preview_length: Ticks(hit.length),
+                preview_key: hit.key,
+            });
+        }
+
         state.note_drag = Some(NoteDrag {
             note: hit.note,
             kind,
@@ -291,6 +391,7 @@ fn handle_input(
             preview_start: Ticks(hit.start),
             preview_length: Ticks(hit.length),
             preview_key: hit.key,
+            notes: note_snapshots,
         });
     }
 
@@ -311,7 +412,9 @@ fn handle_input(
     if response.hovered()
         && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
     {
-        if let Some(drag) = state.note_drag {
+        if state.box_select.is_some() || is_ctrl {
+            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        } else if let Some(ref drag) = state.note_drag {
             ui.ctx().set_cursor_icon(match drag.kind {
                 NoteDragKind::Resize => CursorIcon::ResizeHorizontal,
                 NoteDragKind::Move => CursorIcon::Grabbing,
@@ -333,13 +436,17 @@ fn handle_input(
         && let Some(pointer) = response.interact_pointer_pos()
         && let Some(hit) = hit_test_note(pattern, grid, pointer)
     {
+        let notes_to_remove =
+            if state.is_note_selected(&hit.note) && !state.selected_notes.is_empty() {
+                state.selected_notes.iter().map(|n| n.note).collect()
+            } else {
+                vec![hit.note.note]
+            };
         actions.push(UiAction::Edit(EditCommand::RemoveNotes {
             pattern: pattern.id,
-            notes: vec![hit.note.note],
+            notes: notes_to_remove,
         }));
-        if state.selected_note == Some(hit.note) {
-            state.selected_note = None;
-        }
+        state.deselect_all_notes();
         state.note_drag = None;
     }
 
@@ -352,7 +459,11 @@ fn handle_input(
 
         if let Some(hit) = hit_test_note(pattern, grid, pointer) {
             state.select_pattern(hit.note.pattern);
-            state.selected_note = Some(hit.note);
+            if is_shift || is_ctrl {
+                state.select_note(hit.note, true);
+            } else {
+                state.select_note(hit.note, false);
+            }
             return;
         }
 
@@ -360,15 +471,17 @@ fn handle_input(
             return;
         }
 
-        if let Some(pending) = pending_note(project, pattern, grid, state.snap, pointer) {
-            state.selected_note = None;
-            actions.push(UiAction::Edit(EditCommand::AddNote {
-                pattern: pattern.id,
-                key: pending.key,
-                velocity: 100,
-                start: Ticks(pending.tick),
-                length: Ticks(pending.length),
-            }));
+        if !is_shift && !is_ctrl {
+            state.deselect_all_notes();
+            if let Some(pending) = pending_note(project, pattern, grid, state.snap, pointer) {
+                actions.push(UiAction::Edit(EditCommand::AddNote {
+                    pattern: pattern.id,
+                    key: pending.key,
+                    velocity: 100,
+                    start: Ticks(pending.tick),
+                    length: Ticks(pending.length),
+                }));
+            }
         }
     }
 
@@ -378,7 +491,7 @@ fn handle_input(
             input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
         })
     {
-        delete_selected_note(state, actions);
+        delete_selected_notes(state, actions);
     }
 }
 
@@ -392,7 +505,7 @@ fn update_note_drag(
     pointer: egui::Pos2,
     actions: &mut Vec<UiAction>,
 ) {
-    let Some(drag) = state.note_drag else {
+    let Some(drag) = state.note_drag.clone() else {
         return;
     };
     if pattern.note(drag.note.note).is_none() {
@@ -400,31 +513,71 @@ fn update_note_drag(
         return;
     }
 
-    let delta_ticks = f64::from(pointer.x - drag.pointer_start.x) / grid.px_per_tick;
+    let delta_ticks_raw = f64::from(pointer.x - drag.pointer_start.x) / grid.px_per_tick;
 
-    let mut next = drag;
+    let mut next = drag.clone();
     match drag.kind {
         NoteDragKind::Move => {
-            let start = state.snap.snap_tick(
-                (drag.original_start.0 as f64 + delta_ticks).max(0.0),
+            let target_start = state.snap.snap_tick(
+                (drag.original_start.0 as f64 + delta_ticks_raw).max(0.0),
                 project.tempo_map.ppq(),
             );
-            next.preview_start = Ticks(start);
-            next.preview_length = drag.original_length;
+            let mut delta_ticks = target_start as i64 - drag.original_start.0 as i64;
+            let min_start_limit = next
+                .notes
+                .iter()
+                .map(|n| -(n.original_start.0 as i64))
+                .max()
+                .unwrap_or(0);
+            delta_ticks = delta_ticks.max(min_start_limit);
 
-            let delta_key = (-(pointer.y - drag.pointer_start.y) / grid.key_height).round() as i32;
-            next.preview_key = (i32::from(drag.original_key) + delta_key).clamp(0, 127) as u8;
+            let raw_delta_key =
+                (-(pointer.y - drag.pointer_start.y) / grid.key_height).round() as i32;
+            let min_key = next.notes.iter().map(|n| n.original_key).min().unwrap_or(0);
+            let max_key = next
+                .notes
+                .iter()
+                .map(|n| n.original_key)
+                .max()
+                .unwrap_or(127);
+            let delta_key = raw_delta_key.clamp(-(min_key as i32), 127 - (max_key as i32));
+
+            next.preview_start = Ticks((drag.original_start.0 as i64 + delta_ticks) as u64);
+            next.preview_length = drag.original_length;
+            next.preview_key = (drag.original_key as i32 + delta_key) as u8;
+
+            for snapshot in &mut next.notes {
+                snapshot.preview_start =
+                    Ticks((snapshot.original_start.0 as i64 + delta_ticks) as u64);
+                snapshot.preview_key = (snapshot.original_key as i32 + delta_key) as u8;
+                snapshot.preview_length = snapshot.original_length;
+            }
         }
         NoteDragKind::Resize => {
-            let min_end = drag.original_start.0.saturating_add(1);
             let original_end = drag.original_start.0 + drag.original_length.0;
-            let end = state
-                .snap
-                .snap_tick(original_end as f64 + delta_ticks, project.tempo_map.ppq())
-                .max(min_end);
+            let target_end = state.snap.snap_tick(
+                (original_end as f64 + delta_ticks_raw).max(0.0),
+                project.tempo_map.ppq(),
+            );
+            let mut delta_length = target_end as i64 - original_end as i64;
+            let min_length_limit = next
+                .notes
+                .iter()
+                .map(|n| 1 - n.original_length.0 as i64)
+                .max()
+                .unwrap_or(0);
+            delta_length = delta_length.max(min_length_limit);
+
             next.preview_start = drag.original_start;
-            next.preview_length = Ticks(end - drag.original_start.0);
+            next.preview_length = Ticks((drag.original_length.0 as i64 + delta_length) as u64);
             next.preview_key = drag.original_key;
+
+            for snapshot in &mut next.notes {
+                snapshot.preview_start = snapshot.original_start;
+                snapshot.preview_length =
+                    Ticks((snapshot.original_length.0 as i64 + delta_length) as u64);
+                snapshot.preview_key = snapshot.original_key;
+            }
         }
     }
 
@@ -452,35 +605,49 @@ fn finish_note_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
             let delta_ticks = drag.preview_start.0 as i64 - drag.original_start.0 as i64;
             let delta_key = i32::from(drag.preview_key) - i32::from(drag.original_key);
             if delta_ticks != 0 || delta_key != 0 {
+                let note_ids: Vec<NoteId> = drag.notes.iter().map(|n| n.note.note).collect();
                 actions.push(UiAction::Edit(EditCommand::MoveNotes {
                     pattern: drag.note.pattern,
-                    notes: vec![drag.note.note],
+                    notes: note_ids,
                     delta_ticks,
                     delta_key,
                 }));
             }
         }
         NoteDragKind::Resize => {
-            if drag.preview_length != drag.original_length {
-                actions.push(UiAction::Edit(EditCommand::ResizeNote {
+            let delta_ticks = drag.preview_length.0 as i64 - drag.original_length.0 as i64;
+            if delta_ticks != 0 {
+                let note_ids: Vec<NoteId> = drag.notes.iter().map(|n| n.note.note).collect();
+                actions.push(UiAction::Edit(EditCommand::ResizeNotes {
                     pattern: drag.note.pattern,
-                    note: drag.note.note,
-                    start: drag.preview_start,
-                    length: drag.preview_length,
+                    notes: note_ids,
+                    delta_ticks,
                 }));
             }
         }
     }
 }
 
-fn delete_selected_note(state: &mut UiState, actions: &mut Vec<UiAction>) {
-    let Some(selection) = state.selected_note.take() else {
-        return;
-    };
-    actions.push(UiAction::Edit(EditCommand::RemoveNotes {
-        pattern: selection.pattern,
-        notes: vec![selection.note],
-    }));
+fn delete_selected_notes(state: &mut UiState, actions: &mut Vec<UiAction>) {
+    let mut pattern_notes: HashMap<octava_core::PatternId, Vec<NoteId>> = HashMap::new();
+    for note_ref in &state.selected_notes {
+        pattern_notes
+            .entry(note_ref.pattern)
+            .or_default()
+            .push(note_ref.note);
+    }
+    if pattern_notes.is_empty()
+        && let Some(selection) = state.selected_note
+    {
+        pattern_notes
+            .entry(selection.pattern)
+            .or_default()
+            .push(selection.note);
+    }
+    state.deselect_all_notes();
+    for (pattern, notes) in pattern_notes {
+        actions.push(UiAction::Edit(EditCommand::RemoveNotes { pattern, notes }));
+    }
 }
 
 fn key_at_y(grid: &Grid, y: f32) -> u8 {
@@ -799,7 +966,7 @@ fn draw_notes(
 ) {
     let painter = ui.painter_at(grid.rect);
     let color = theme::pattern_color(pattern_index);
-    let drag = state.note_drag;
+    let drag = state.note_drag.as_ref();
 
     for note in &pattern.notes {
         let clipped_end = note.start.saturating_add(note.length).min(pattern.length);
@@ -811,17 +978,25 @@ fn draw_notes(
             pattern: pattern.id,
             note: note.id,
         };
-        let active_drag = drag.filter(|drag| drag.note == note_ref);
-        let (relative_start, length, key) = active_drag.map_or(
-            (note.start.0, clipped_end.0 - note.start.0, note.key),
-            |drag| {
-                (
-                    drag.preview_start.0,
-                    drag.preview_length.0,
-                    drag.preview_key,
-                )
-            },
-        );
+        let active_drag = drag.and_then(|drag| {
+            drag.notes
+                .iter()
+                .find(|s| s.note == note_ref)
+                .map(|s| (s.preview_start.0, s.preview_length.0, s.preview_key))
+                .or_else(|| {
+                    if drag.note == note_ref {
+                        Some((
+                            drag.preview_start.0,
+                            drag.preview_length.0,
+                            drag.preview_key,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+        });
+        let (relative_start, length, key) =
+            active_drag.unwrap_or_else(|| (note.start.0, clipped_end.0 - note.start.0, note.key));
         let start = relative_start as f64;
         let note_rect = note_screen_rect(grid, relative_start, length, key);
         let x1 = grid.tick_to_x(start + length as f64);
@@ -841,8 +1016,9 @@ fn draw_notes(
         }
 
         let velocity = f32::from(note.velocity) / 127.0;
-        let selected = state.selected_note == Some(note_ref);
-        let fill = if selected || active_drag.is_some() {
+        let selected = state.is_note_selected(&note_ref);
+        let is_dragging = active_drag.is_some();
+        let fill = if selected || is_dragging {
             color
         } else {
             color.gamma_multiply(0.58 + 0.42 * velocity)
@@ -855,7 +1031,7 @@ fn draw_notes(
             StrokeKind::Inside,
         );
 
-        if selected || active_drag.is_some() {
+        if selected || is_dragging {
             painter.rect_stroke(
                 note_rect,
                 CornerRadius::same(3),
@@ -869,6 +1045,34 @@ fn draw_notes(
                 ),
                 CornerRadius::same(1),
                 theme::TEXT,
+            );
+        }
+    }
+}
+
+fn draw_marquee(ui: &egui::Ui, grid: &Grid, state: &UiState) {
+    if let Some(box_sel) = state.box_select.as_ref() {
+        let painter = ui.painter_at(grid.rect);
+        let min_x = box_sel.start.x.min(box_sel.current.x).max(grid.rect.left());
+        let max_x = box_sel
+            .start
+            .x
+            .max(box_sel.current.x)
+            .min(grid.rect.right());
+        let min_y = box_sel.start.y.min(box_sel.current.y).max(grid.rect.top());
+        let max_y = box_sel
+            .start
+            .y
+            .max(box_sel.current.y)
+            .min(grid.rect.bottom());
+        if max_x > min_x && max_y > min_y {
+            let rect = Rect::from_min_max(pos2(min_x, min_y), pos2(max_x, max_y));
+            painter.rect_filled(rect, CornerRadius::ZERO, theme::ACCENT.gamma_multiply(0.18));
+            painter.rect_stroke(
+                rect,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.85)),
+                StrokeKind::Inside,
             );
         }
     }
@@ -1075,7 +1279,7 @@ fn draw_pending_note(
     grid: &Grid,
     state: &UiState,
 ) {
-    if state.note_drag.is_some() {
+    if state.note_drag.is_some() || state.box_select.is_some() {
         return;
     }
 

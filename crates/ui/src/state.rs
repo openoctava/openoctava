@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use egui::Pos2;
@@ -216,7 +217,7 @@ pub(crate) struct ClipRef {
 
 /// A note inside a pattern. Notes are shared by every placement of a pattern,
 /// so the pattern id is part of the reference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NoteRef {
     pub pattern: PatternId,
     pub note: NoteId,
@@ -251,6 +252,17 @@ pub(crate) enum NoteDragKind {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct NoteDragSnapshot {
+    pub note: NoteRef,
+    pub original_start: Ticks,
+    pub original_length: Ticks,
+    pub original_key: u8,
+    pub preview_start: Ticks,
+    pub preview_length: Ticks,
+    pub preview_key: u8,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct NoteDrag {
     pub note: NoteRef,
     pub kind: NoteDragKind,
@@ -261,6 +273,14 @@ pub(crate) struct NoteDrag {
     pub preview_start: Ticks,
     pub preview_length: Ticks,
     pub preview_key: u8,
+    pub notes: Vec<NoteDragSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BoxSelect {
+    pub start: Pos2,
+    pub current: Pos2,
+    pub initial_selected: BTreeSet<NoteRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,6 +426,8 @@ pub(crate) struct UiState {
     /// Pattern opened in the piano roll / focused in the clips library.
     pub selected_pattern: Option<PatternId>,
     pub selected_note: Option<NoteRef>,
+    pub selected_notes: BTreeSet<NoteRef>,
+    pub box_select: Option<BoxSelect>,
     /// Sample placement selected on the timeline.
     pub selected_sample: Option<SampleRef>,
     pub clipboard: Option<ClipboardClip>,
@@ -427,45 +449,49 @@ pub(crate) struct UiState {
 
 impl UiState {
     pub fn ensure_valid_selection(&mut self, project: &Project) {
-        if self
+        let selected_track_is_valid = self
             .selected_track
-            .is_none_or(|id| project.track(id).is_none())
-        {
+            .is_some_and(|track| project.track(track).is_some());
+        if !selected_track_is_valid {
             self.selected_track = project.tracks.first().map(|track| track.id);
         }
 
-        let clip_is_valid = self.selected_clip.is_some_and(|selection| {
+        let selected_clip_is_valid = self.selected_clip.is_some_and(|selection| {
             project
                 .track(selection.track)
                 .and_then(|track| track.clip(selection.clip))
                 .is_some()
         });
-        if !clip_is_valid {
-            self.selected_clip = self.selected_track.and_then(|id| {
-                let track = project.track(id)?;
-                let clip = track.clips.first()?;
-                Some(ClipRef {
-                    track: id,
-                    clip: clip.id,
-                })
-            });
+        if !selected_clip_is_valid {
+            self.selected_clip = None;
         }
 
-        if self
+        let selected_pattern_is_valid = self
             .selected_pattern
-            .is_none_or(|id| project.pattern(id).is_none())
-        {
+            .is_some_and(|pattern| project.pattern(pattern).is_some());
+        if !selected_pattern_is_valid {
             self.selected_pattern = self
                 .selected_clip
-                .and_then(|selection| {
-                    project
-                        .track(selection.track)
-                        .and_then(|track| track.clip(selection.clip))
-                        .map(|clip| clip.pattern)
-                })
+                .and_then(|selection| project.track(selection.track))
+                .and_then(|track| track.clip(self.selected_clip?.clip))
+                .map(|clip| clip.pattern)
                 .or_else(|| project.patterns.first().map(|pattern| pattern.id));
         }
 
+        self.selected_notes.retain(|selection| {
+            project
+                .pattern(selection.pattern)
+                .and_then(|pattern| pattern.note(selection.note))
+                .is_some()
+        });
+        if let Some(box_sel) = &mut self.box_select {
+            box_sel.initial_selected.retain(|selection| {
+                project
+                    .pattern(selection.pattern)
+                    .and_then(|pattern| pattern.note(selection.note))
+                    .is_some()
+            });
+        }
         let selected_note_is_valid = self.selected_note.is_some_and(|selection| {
             project
                 .pattern(selection.pattern)
@@ -473,10 +499,10 @@ impl UiState {
                 .is_some()
         });
         if !selected_note_is_valid {
-            self.selected_note = None;
+            self.selected_note = self.selected_notes.iter().copied().next();
         }
 
-        let note_drag_is_valid = self.note_drag.is_some_and(|drag| {
+        let note_drag_is_valid = self.note_drag.as_ref().is_some_and(|drag| {
             project
                 .pattern(drag.note.pattern)
                 .and_then(|pattern| pattern.note(drag.note.note))
@@ -496,16 +522,6 @@ impl UiState {
             self.clip_drag = None;
         }
 
-        let selected_sample_is_valid = self.selected_sample.is_some_and(|selection| {
-            project
-                .track(selection.track)
-                .and_then(|track| track.sample(selection.sample))
-                .is_some()
-        });
-        if !selected_sample_is_valid {
-            self.selected_sample = None;
-        }
-
         let sample_drag_is_valid = self.sample_drag.is_some_and(|drag| {
             project
                 .track(drag.track)
@@ -516,71 +532,53 @@ impl UiState {
             self.sample_drag = None;
         }
 
-        let track_drag_is_valid = self.track_drag.is_some_and(|drag| {
-            project.track(drag.track).is_some()
-                && drag.original_index < project.tracks.len()
-                && drag.target_index < project.tracks.len()
-        });
-        if !track_drag_is_valid {
-            self.track_drag = None;
-        }
-
-        if self
-            .mixer_drag
-            .is_some_and(|drag| project.track(drag.track).is_none())
-        {
-            self.mixer_drag = None;
-        }
-
-        // A clip created by Duplicate/Paste becomes the selection so that the
-        // next Ctrl+D continues from its end.
-        if let Some(pending) = self.pending_clip.take()
-            && let Some(clip) = project.track(pending.track).and_then(|track| {
-                track
-                    .clips
-                    .iter()
-                    .find(|clip| clip.pattern == pending.pattern && clip.start == pending.start)
-            })
-        {
-            self.select_clip(project, pending.track, clip.id);
+        let soundfont_player_is_valid = self
+            .soundfont_player
+            .is_some_and(|pattern| project.pattern(pattern).is_some());
+        if !soundfont_player_is_valid {
+            self.soundfont_player = None;
         }
     }
 
-    pub fn select_track(&mut self, project: &Project, id: TrackId) {
-        self.selected_track = Some(id);
+    /// Selects a track and picks an appropriate pattern to show in the piano roll:
+    /// - If the track has clips of only one pattern, selects that pattern.
+    /// - If the track has multiple patterns, picks the one with the earliest start.
+    /// - Otherwise leaves `selected_pattern` alone.
+    pub fn select_track(&mut self, project: &Project, track: TrackId) {
+        self.selected_track = Some(track);
+        self.selected_clip = None;
         self.selected_sample = None;
-        self.selected_clip = project
-            .track(id)
-            .and_then(|track| track.clips.first())
-            .map(|clip| ClipRef {
-                track: id,
-                clip: clip.id,
-            });
-        if let Some(selection) = self.selected_clip
-            && let Some(pattern) = project
-                .track(selection.track)
-                .and_then(|track| track.clip(selection.clip))
-                .map(|clip| clip.pattern)
-        {
+        let Some(track_data) = project.track(track) else {
+            return;
+        };
+        let mut patterns_in_track = track_data
+            .clips
+            .iter()
+            .map(|clip| (clip.start, clip.pattern))
+            .collect::<Vec<_>>();
+        patterns_in_track.sort_by_key(|(start, _)| *start);
+        if let Some((_, pattern)) = patterns_in_track.first() {
+            self.selected_pattern = Some(*pattern);
+        } else if let Some(pattern) = project.patterns.first().map(|p| p.id) {
             self.selected_pattern = Some(pattern);
         }
         self.selected_note = None;
+        self.selected_notes.clear();
     }
 
     pub fn select_clip(&mut self, project: &Project, track: TrackId, clip: ClipId) {
         let selection = ClipRef { track, clip };
         if self.selected_clip != Some(selection) {
             self.selected_note = None;
+            self.selected_notes.clear();
         }
         self.selected_track = Some(track);
         self.selected_sample = None;
         self.selected_clip = Some(selection);
-        if let Some(pattern) = project
-            .track(track)
-            .and_then(|track| track.clip(clip))
-            .map(|clip| clip.pattern)
+        if let Some(track) = project.track(track)
+            && let Some(clip) = track.clip(clip)
         {
-            self.selected_pattern = Some(pattern);
+            self.selected_pattern = Some(clip.pattern);
         }
     }
 
@@ -589,17 +587,46 @@ impl UiState {
         if self.selected_sample != Some(selection) {
             self.selected_clip = None;
             self.selected_note = None;
+            self.selected_notes.clear();
         }
         self.selected_track = Some(track);
         self.selected_sample = Some(selection);
     }
 
-    /// Selects a pattern in the clips library. Playback is unaffected: a
+    /// Focuses a pattern in the piano roll. Note that an auditioned track
     /// pattern only sounds where it has been placed on a track.
     pub fn select_pattern(&mut self, pattern: PatternId) {
         if self.selected_pattern != Some(pattern) {
-            self.selected_note = None;
+            self.deselect_all_notes();
         }
         self.selected_pattern = Some(pattern);
+    }
+
+    pub fn is_note_selected(&self, note: &NoteRef) -> bool {
+        self.selected_notes.contains(note) || self.selected_note == Some(*note)
+    }
+
+    pub fn select_note(&mut self, note: NoteRef, add: bool) {
+        if add {
+            if self.selected_notes.contains(&note) {
+                self.selected_notes.remove(&note);
+                if self.selected_note == Some(note) {
+                    self.selected_note = self.selected_notes.iter().copied().next();
+                }
+            } else {
+                self.selected_notes.insert(note);
+                self.selected_note = Some(note);
+            }
+        } else {
+            self.selected_notes.clear();
+            self.selected_notes.insert(note);
+            self.selected_note = Some(note);
+        }
+    }
+
+    pub fn deselect_all_notes(&mut self) {
+        self.selected_note = None;
+        self.selected_notes.clear();
+        self.box_select = None;
     }
 }

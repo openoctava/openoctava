@@ -42,6 +42,7 @@ pub struct OctavaApp {
     export_path: String,
     dialog_tx: Sender<DialogMessage>,
     dialog_rx: Receiver<DialogMessage>,
+    dialog_in_flight: bool,
 }
 
 #[derive(Debug)]
@@ -51,6 +52,7 @@ enum DialogMessage {
     ChooseSoundfont(PathBuf),
     OpenSampleFolder(PathBuf),
     Error(String),
+    Closed,
 }
 
 impl OctavaApp {
@@ -96,6 +98,7 @@ impl OctavaApp {
             export_path: String::new(),
             dialog_tx,
             dialog_rx,
+            dialog_in_flight: false,
         };
         app.refresh_soundfont();
         if app.files.folder.is_some() {
@@ -259,6 +262,7 @@ impl OctavaApp {
 
     fn pump_dialogs(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.dialog_rx.try_recv() {
+            self.dialog_in_flight = false;
             match msg {
                 DialogMessage::SaveProjectAs(path) => {
                     self.write_project(&path);
@@ -280,28 +284,52 @@ impl OctavaApp {
                 DialogMessage::Error(error) => {
                     self.last_error = Some(error);
                 }
+                DialogMessage::Closed => {}
             }
         }
     }
 
     /// Opens the desktop's native file picker for SoundFonts on a background thread.
     fn choose_soundfont(&mut self, ctx: &egui::Context) {
-        let mut dialog = rfd::AsyncFileDialog::new()
-            .set_title("Choose a SoundFont")
-            .add_filter("SoundFont", &["sf2", "sf3"]);
-        if let Some(directory) = self
+        if self.dialog_in_flight {
+            return;
+        }
+        self.dialog_in_flight = true;
+
+        let default_dir = self
             .store
             .project()
             .soundfont
             .as_deref()
             .and_then(|path| path.parent())
-        {
-            dialog = dialog.set_directory(directory);
-        }
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
 
         let tx = self.dialog_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            if let Some(choice) = zenity_open_file(
+                "Choose a SoundFont",
+                "SoundFont (*.sf2, *.sf3)",
+                "*.sf2 *.sf3",
+                default_dir.as_deref(),
+            ) {
+                if let Some(path) = choice {
+                    let _ = tx.send(DialogMessage::ChooseSoundfont(path));
+                } else {
+                    let _ = tx.send(DialogMessage::Closed);
+                }
+                ctx.request_repaint();
+                return;
+            }
+
+            let mut dialog = rfd::AsyncFileDialog::new()
+                .set_title("Choose a SoundFont")
+                .add_filter("SoundFont", &["sf2", "sf3"]);
+            if let Some(ref dir) = default_dir {
+                dialog = dialog.set_directory(dir);
+            }
+
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -315,22 +343,58 @@ impl OctavaApp {
             };
             if let Some(file) = runtime.block_on(dialog.pick_file()) {
                 let _ = tx.send(DialogMessage::ChooseSoundfont(file.path().to_path_buf()));
-                ctx.request_repaint();
+            } else {
+                let _ = tx.send(DialogMessage::Closed);
             }
+            ctx.request_repaint();
         });
     }
 
     fn open_project(&mut self, ctx: &egui::Context) {
-        let mut dialog = rfd::AsyncFileDialog::new()
-            .set_title("Open Project")
-            .add_filter("Octava project", &[PROJECT_EXTENSION]);
-        if let Some(directory) = self.project_path.as_deref().and_then(Path::parent) {
-            dialog = dialog.set_directory(directory);
+        if self.dialog_in_flight {
+            return;
         }
+        self.dialog_in_flight = true;
+
+        let default_dir = self
+            .project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                self.config
+                    .recent_projects
+                    .first()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+            })
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Documents")))
+            .or_else(|| std::env::current_dir().ok());
 
         let tx = self.dialog_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            if let Some(choice) = zenity_open_file(
+                "Open Project",
+                "Octava project",
+                &format!("*.{PROJECT_EXTENSION}"),
+                default_dir.as_deref(),
+            ) {
+                if let Some(path) = choice {
+                    let _ = tx.send(DialogMessage::OpenProject(path));
+                } else {
+                    let _ = tx.send(DialogMessage::Closed);
+                }
+                ctx.request_repaint();
+                return;
+            }
+
+            let mut dialog = rfd::AsyncFileDialog::new()
+                .set_title("Open Project")
+                .add_filter("Octava project", &[PROJECT_EXTENSION]);
+            if let Some(ref dir) = default_dir {
+                dialog = dialog.set_directory(dir);
+            }
+
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -344,8 +408,10 @@ impl OctavaApp {
             };
             if let Some(file) = runtime.block_on(dialog.pick_file()) {
                 let _ = tx.send(DialogMessage::OpenProject(file.path().to_path_buf()));
-                ctx.request_repaint();
+            } else {
+                let _ = tx.send(DialogMessage::Closed);
             }
+            ctx.request_repaint();
         });
     }
 
@@ -389,26 +455,59 @@ impl OctavaApp {
     }
 
     fn save_project_as(&mut self, ctx: &egui::Context) {
-        let mut dialog = rfd::AsyncFileDialog::new()
-            .set_title("Save Project As")
-            .add_filter("Octava project", &[PROJECT_EXTENSION]);
-        if let Some(path) = &self.project_path {
-            if let Some(directory) = path.parent() {
-                dialog = dialog.set_directory(directory);
-            }
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                dialog = dialog.set_file_name(name);
-            }
-        } else {
-            dialog = dialog.set_file_name(format!(
-                "{}.{PROJECT_EXTENSION}",
-                slug(&self.store.project().name)
-            ));
+        if self.dialog_in_flight {
+            return;
         }
+        self.dialog_in_flight = true;
+
+        let default_dir = self
+            .project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                self.config
+                    .recent_projects
+                    .first()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+            })
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Documents")))
+            .or_else(|| std::env::current_dir().ok());
+
+        let default_name = self
+            .project_path
+            .as_ref()
+            .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+            .unwrap_or_else(|| format!("{}.{PROJECT_EXTENSION}", slug(&self.store.project().name)));
+
+        let default_path = default_dir.as_ref().map(|dir| dir.join(&default_name));
 
         let tx = self.dialog_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            if let Some(choice) = zenity_save_file(
+                "Save Project As",
+                "Octava project",
+                PROJECT_EXTENSION,
+                default_path.as_deref(),
+            ) {
+                if let Some(path) = choice {
+                    let _ = tx.send(DialogMessage::SaveProjectAs(path));
+                } else {
+                    let _ = tx.send(DialogMessage::Closed);
+                }
+                ctx.request_repaint();
+                return;
+            }
+
+            let mut dialog = rfd::AsyncFileDialog::new()
+                .set_title("Save Project As")
+                .add_filter("Octava project", &[PROJECT_EXTENSION])
+                .set_file_name(&default_name);
+            if let Some(ref dir) = default_dir {
+                dialog = dialog.set_directory(dir);
+            }
+
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -426,8 +525,10 @@ impl OctavaApp {
                     path.set_extension(PROJECT_EXTENSION);
                 }
                 let _ = tx.send(DialogMessage::SaveProjectAs(path));
-                ctx.request_repaint();
+            } else {
+                let _ = tx.send(DialogMessage::Closed);
             }
+            ctx.request_repaint();
         });
     }
 
@@ -454,14 +555,38 @@ impl OctavaApp {
     }
 
     fn open_sample_folder(&mut self, ctx: &egui::Context) {
-        let mut dialog = rfd::AsyncFileDialog::new().set_title("Choose a sample folder");
-        if let Some(folder) = &self.files.folder {
-            dialog = dialog.set_directory(folder.as_str());
+        if self.dialog_in_flight {
+            return;
         }
+        self.dialog_in_flight = true;
+
+        let default_dir = self
+            .files
+            .folder
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
 
         let tx = self.dialog_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            if let Some(choice) =
+                zenity_pick_folder("Choose a sample folder", default_dir.as_deref())
+            {
+                if let Some(folder) = choice {
+                    let _ = tx.send(DialogMessage::OpenSampleFolder(folder));
+                } else {
+                    let _ = tx.send(DialogMessage::Closed);
+                }
+                ctx.request_repaint();
+                return;
+            }
+
+            let mut dialog = rfd::AsyncFileDialog::new().set_title("Choose a sample folder");
+            if let Some(ref dir) = default_dir {
+                dialog = dialog.set_directory(dir);
+            }
+
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -475,8 +600,10 @@ impl OctavaApp {
             };
             if let Some(folder) = runtime.block_on(dialog.pick_folder()) {
                 let _ = tx.send(DialogMessage::OpenSampleFolder(folder.path().to_path_buf()));
-                ctx.request_repaint();
+            } else {
+                let _ = tx.send(DialogMessage::Closed);
             }
+            ctx.request_repaint();
         });
     }
 
@@ -741,7 +868,7 @@ impl eframe::App for OctavaApp {
         }
 
         if let Some(message) = self.notice.clone() {
-            egui::Window::new("Export complete")
+            egui::Window::new("Notice")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -64.0])
@@ -904,5 +1031,102 @@ fn slug(name: &str) -> String {
         "octava".to_owned()
     } else {
         slug.to_owned()
+    }
+}
+
+fn zenity_save_file(
+    title: &str,
+    filter_name: &str,
+    filter_ext: &str,
+    default_path: Option<&Path>,
+) -> Option<Option<PathBuf>> {
+    let mut cmd = std::process::Command::new("zenity");
+    cmd.arg("--file-selection")
+        .arg("--save")
+        .arg("--confirm-overwrite")
+        .arg(format!("--title={title}"))
+        .arg(format!("--file-filter={filter_name} | *.{filter_ext}"));
+    if let Some(path) = default_path {
+        cmd.arg(format!("--filename={}", path.display()));
+    }
+    let output = cmd.output().ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() {
+            Some(None)
+        } else {
+            let mut path = PathBuf::from(s);
+            if path.extension().is_none() {
+                path.set_extension(filter_ext);
+            }
+            Some(Some(path))
+        }
+    } else if output.status.code() == Some(1) {
+        Some(None)
+    } else {
+        None
+    }
+}
+
+fn zenity_open_file(
+    title: &str,
+    filter_name: &str,
+    filter_pattern: &str,
+    default_dir: Option<&Path>,
+) -> Option<Option<PathBuf>> {
+    let mut cmd = std::process::Command::new("zenity");
+    cmd.arg("--file-selection")
+        .arg(format!("--title={title}"))
+        .arg(format!("--file-filter={filter_name} | {filter_pattern}"));
+    if let Some(dir) = default_dir {
+        let dir_str = dir.display().to_string();
+        let filename_arg = if dir_str.ends_with('/') {
+            dir_str
+        } else {
+            format!("{dir_str}/")
+        };
+        cmd.arg(format!("--filename={filename_arg}"));
+    }
+    let output = cmd.output().ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() {
+            Some(None)
+        } else {
+            Some(Some(PathBuf::from(s)))
+        }
+    } else if output.status.code() == Some(1) {
+        Some(None)
+    } else {
+        None
+    }
+}
+
+fn zenity_pick_folder(title: &str, default_dir: Option<&Path>) -> Option<Option<PathBuf>> {
+    let mut cmd = std::process::Command::new("zenity");
+    cmd.arg("--file-selection")
+        .arg("--directory")
+        .arg(format!("--title={title}"));
+    if let Some(dir) = default_dir {
+        let dir_str = dir.display().to_string();
+        let filename_arg = if dir_str.ends_with('/') {
+            dir_str
+        } else {
+            format!("{dir_str}/")
+        };
+        cmd.arg(format!("--filename={filename_arg}"));
+    }
+    let output = cmd.output().ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() {
+            Some(None)
+        } else {
+            Some(Some(PathBuf::from(s)))
+        }
+    } else if output.status.code() == Some(1) {
+        Some(None)
+    } else {
+        None
     }
 }

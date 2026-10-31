@@ -97,6 +97,11 @@ pub enum EditCommand {
         delta_ticks: i64,
         delta_key: i32,
     },
+    ResizeNotes {
+        pattern: PatternId,
+        notes: Vec<NoteId>,
+        delta_ticks: i64,
+    },
     ResizeNote {
         pattern: PatternId,
         note: NoteId,
@@ -429,6 +434,49 @@ pub(crate) fn apply(
             outcome.note = Some(*note);
             outcome.pattern = Some(*pattern);
         }
+        EditCommand::ResizeNotes {
+            pattern,
+            notes,
+            delta_ticks,
+        } => {
+            let index = project
+                .pattern_index(*pattern)
+                .ok_or(ModelError::PatternNotFound(*pattern))?;
+            let stored = &project.patterns[index];
+            let indices = unique_note_indices(stored, notes)?;
+            if indices.is_empty() {
+                return Ok(outcome);
+            }
+
+            let mut max_end = stored.length;
+            for note_index in &indices {
+                let note = &stored.notes[*note_index];
+                let new_length = note.length.0 as i128 + i128::from(*delta_ticks);
+                if new_length <= 0 || new_length > u64::MAX as i128 {
+                    return Err(ModelError::InvalidNoteLength);
+                }
+                let end = note.start.saturating_add(Ticks(new_length as u64));
+                if end > max_end {
+                    max_end = end;
+                }
+            }
+            if max_end > project.patterns[index].length {
+                project.ensure_pattern_capacity(*pattern, max_end);
+            }
+            let stored = &project.patterns[index];
+            for note_index in &indices {
+                let note = &stored.notes[*note_index];
+                let new_length = (note.length.0 as i128 + i128::from(*delta_ticks)) as u64;
+                validate_note_geometry(note.start, Ticks(new_length), stored.length)?;
+            }
+
+            let stored = &mut project.patterns[index];
+            for note_index in indices {
+                let note = &mut stored.notes[note_index];
+                note.length = Ticks((note.length.0 as i128 + i128::from(*delta_ticks)) as u64);
+            }
+            outcome.pattern = Some(*pattern);
+        }
         EditCommand::SetNoteVelocity {
             pattern,
             note,
@@ -690,6 +738,51 @@ mod tests {
             .unwrap()
             .length;
         assert_eq!(length, Ticks(3840));
+    }
+
+    #[test]
+    fn resize_notes_updates_all_targets_and_supports_undo() {
+        let (mut store, _track, pattern, _clip) = fixture();
+
+        let note1 = store
+            .apply(EditCommand::AddNote {
+                pattern,
+                key: 60,
+                velocity: 100,
+                start: Ticks(0),
+                length: Ticks(240),
+            })
+            .unwrap()
+            .note
+            .unwrap();
+        let note2 = store
+            .apply(EditCommand::AddNote {
+                pattern,
+                key: 64,
+                velocity: 100,
+                start: Ticks(240),
+                length: Ticks(480),
+            })
+            .unwrap()
+            .note
+            .unwrap();
+
+        store
+            .apply(EditCommand::ResizeNotes {
+                pattern,
+                notes: vec![note1, note2],
+                delta_ticks: 120,
+            })
+            .unwrap();
+
+        let p = store.project().pattern(pattern).unwrap();
+        assert_eq!(p.note(note1).unwrap().length, Ticks(360));
+        assert_eq!(p.note(note2).unwrap().length, Ticks(600));
+
+        store.undo();
+        let p = store.project().pattern(pattern).unwrap();
+        assert_eq!(p.note(note1).unwrap().length, Ticks(240));
+        assert_eq!(p.note(note2).unwrap().length, Ticks(480));
     }
 
     #[test]

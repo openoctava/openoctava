@@ -100,6 +100,8 @@ impl OctavaUi {
         state.selected_clip = None;
         state.selected_pattern = None;
         state.selected_note = None;
+        state.selected_notes.clear();
+        state.box_select = None;
         state.selected_sample = None;
         state.clipboard = None;
         state.pending_clip = None;
@@ -198,7 +200,8 @@ impl OctavaUi {
         let mut toggle_tab = None;
         let selected_track = self.state.selected_track;
         let selected_pattern = self.state.selected_pattern;
-        let selected_note = self.state.selected_note;
+        let has_selected_notes =
+            !self.state.selected_notes.is_empty() || self.state.selected_note.is_some();
         let open_tabs = Tab::ALL.map(|tab| self.dock.find_tab(&tab).is_some());
 
         egui::Panel::top("octava-titlebar")
@@ -322,16 +325,36 @@ impl OctavaUi {
                         }
                         if ui
                             .add_enabled(
-                                selected_note.is_some(),
-                                egui::Button::new("Delete Selected Note"),
+                                has_selected_notes,
+                                egui::Button::new("Delete Selected Notes"),
                             )
                             .clicked()
-                            && let Some(selection) = selected_note
                         {
-                            actions.push(UiAction::Edit(EditCommand::RemoveNotes {
-                                pattern: selection.pattern,
-                                notes: vec![selection.note],
-                            }));
+                            let mut pattern_notes: std::collections::HashMap<
+                                octava_core::PatternId,
+                                Vec<octava_core::NoteId>,
+                            > = std::collections::HashMap::new();
+                            for note_ref in &self.state.selected_notes {
+                                pattern_notes
+                                    .entry(note_ref.pattern)
+                                    .or_default()
+                                    .push(note_ref.note);
+                            }
+                            if pattern_notes.is_empty()
+                                && let Some(selection) = self.state.selected_note
+                            {
+                                pattern_notes
+                                    .entry(selection.pattern)
+                                    .or_default()
+                                    .push(selection.note);
+                            }
+                            self.state.deselect_all_notes();
+                            for (pattern, notes) in pattern_notes {
+                                actions.push(UiAction::Edit(EditCommand::RemoveNotes {
+                                    pattern,
+                                    notes,
+                                }));
+                            }
                             ui.close();
                         }
                     });
