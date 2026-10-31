@@ -73,6 +73,7 @@ pub enum EditCommand {
         track: TrackId,
         clip: ClipId,
         start: Ticks,
+        target_track: Option<TrackId>,
     },
     ResizeClip {
         track: TrackId,
@@ -293,9 +294,20 @@ pub(crate) fn apply(
             project.tracks[track_index].clips.remove(clip_index);
             outcome.clip = Some(*clip);
         }
-        EditCommand::MoveClip { track, clip, start } => {
+        EditCommand::MoveClip {
+            track,
+            clip,
+            start,
+            target_track,
+        } => {
             let (track_index, clip_index) = locate_clip(project, *track, *clip)?;
-            project.tracks[track_index].clips[clip_index].start = *start;
+            let mut clip_data = project.tracks[track_index].clips.remove(clip_index);
+            clip_data.start = *start;
+            let dest_track = target_track.unwrap_or(*track);
+            let dest_index = project
+                .track_index(dest_track)
+                .ok_or(ModelError::TrackNotFound(dest_track))?;
+            project.tracks[dest_index].clips.push(clip_data);
             outcome.clip = Some(*clip);
         }
         EditCommand::ResizeClip {
@@ -358,6 +370,7 @@ pub(crate) fn apply(
                 return Ok(outcome);
             }
 
+            let mut max_end = stored.length;
             for note_index in &indices {
                 let note = &stored.notes[*note_index];
                 let new_start = note.start.0 as i128 + i128::from(*delta_ticks);
@@ -368,7 +381,19 @@ pub(crate) fn apply(
                 if !(0..=127).contains(&new_key) {
                     return Err(ModelError::InvalidKey(new_key as i32));
                 }
-                validate_note_geometry(Ticks(new_start as u64), note.length, stored.length)?;
+                let end = Ticks((new_start as u64).saturating_add(note.length.0));
+                if end > max_end {
+                    max_end = end;
+                }
+            }
+            if max_end > project.patterns[index].length {
+                project.ensure_pattern_capacity(*pattern, max_end);
+            }
+            let stored = &project.patterns[index];
+            for note_index in &indices {
+                let note = &stored.notes[*note_index];
+                let new_start = (note.start.0 as i128 + i128::from(*delta_ticks)) as u64;
+                validate_note_geometry(Ticks(new_start), note.length, stored.length)?;
             }
 
             let stored = &mut project.patterns[index];
@@ -388,6 +413,10 @@ pub(crate) fn apply(
             let index = project
                 .pattern_index(*pattern)
                 .ok_or(ModelError::PatternNotFound(*pattern))?;
+            let end = start.saturating_add(*length);
+            if end > project.patterns[index].length {
+                project.ensure_pattern_capacity(*pattern, end);
+            }
             let stored = &project.patterns[index];
             let note_index = stored
                 .note_index(*note)
@@ -661,6 +690,36 @@ mod tests {
             .unwrap()
             .length;
         assert_eq!(length, Ticks(3840));
+    }
+
+    #[test]
+    fn move_clip_between_tracks_and_supports_undo() {
+        let mut project = Project::new("Test");
+        let t1 = project.add_track("T1").unwrap();
+        let t2 = project.add_track("T2").unwrap();
+        let p = project.add_pattern("P", Ticks(960)).unwrap();
+        let clip = project.add_clip(t1, p, Ticks::ZERO).unwrap();
+        let mut store = ProjectStore::new(project);
+
+        assert_eq!(store.project().track(t1).unwrap().clips.len(), 1);
+        assert_eq!(store.project().track(t2).unwrap().clips.len(), 0);
+
+        store
+            .apply(EditCommand::MoveClip {
+                track: t1,
+                clip,
+                start: Ticks(480),
+                target_track: Some(t2),
+            })
+            .unwrap();
+
+        assert_eq!(store.project().track(t1).unwrap().clips.len(), 0);
+        let moved = store.project().track(t2).unwrap().clip(clip).unwrap();
+        assert_eq!(moved.start, Ticks(480));
+
+        store.undo();
+        assert_eq!(store.project().track(t1).unwrap().clips.len(), 1);
+        assert_eq!(store.project().track(t2).unwrap().clips.len(), 0);
     }
 
     #[test]

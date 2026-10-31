@@ -249,6 +249,31 @@ impl OctavaUi {
                             actions.push(UiAction::OpenProject);
                             ui.close();
                         }
+                        ui.menu_button("Open Recent", |ui| {
+                            if document.recent_projects.is_empty() {
+                                ui.add_enabled(false, egui::Button::new("No recent projects"));
+                            } else {
+                                for path in &document.recent_projects {
+                                    let label = path
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("project");
+                                    if ui
+                                        .button(label)
+                                        .on_hover_text(path.display().to_string())
+                                        .clicked()
+                                    {
+                                        actions.push(UiAction::OpenRecentProject(path.clone()));
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("Clear Recent").clicked() {
+                                    actions.push(UiAction::ClearRecentProjects);
+                                    ui.close();
+                                }
+                            }
+                        });
                         ui.separator();
                         if ui.button("Save Project    Ctrl+S").clicked() {
                             actions.push(UiAction::SaveProject);

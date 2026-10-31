@@ -2911,6 +2911,8 @@ dependencies = [
  "octava-render",
  "octava-ui",
  "rfd",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

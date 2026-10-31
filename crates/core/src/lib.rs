@@ -20,7 +20,7 @@ pub use model::{
 };
 pub use persist::{
     PROJECT_EXTENSION, PROJECT_FORMAT, PROJECT_VERSION, PersistError, decode_project,
-    encode_project,
+    decode_project_at, encode_project, encode_project_at,
 };
 pub use sample::{SampleCache, SampleData, SampleError, SampleInfo, load_sample, probe_sample};
 pub use snapshot::{EventKind, PlaybackSnapshot, SnapshotTrack, TimedEvent, TimedSample};

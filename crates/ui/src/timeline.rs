@@ -1,6 +1,6 @@
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, RichText, Sense, Stroke, StrokeKind,
-    Vec2, pos2, vec2,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, RichText, Sense, Stroke,
+    StrokeKind, Vec2, pos2, vec2,
 };
 use octava_core::{EditCommand, PatternId, Project, Ticks, Track};
 
@@ -93,7 +93,7 @@ pub(crate) fn show(
     handle_shortcuts(ui, project, playback, state, actions);
 
     if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
-        update_clip_drag(project, state, px_per_tick, pointer.x);
+        update_clip_drag(project, state, px_per_tick, pointer, lanes_top);
         update_sample_drag(project, state, px_per_tick, pointer.x);
         update_track_drag(project, state, pointer.y, lanes_top, project.tracks.len());
     }
@@ -752,7 +752,13 @@ fn finish_track_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
     }
 }
 
-fn update_clip_drag(project: &Project, state: &mut UiState, px_per_tick: f64, pointer_x: f32) {
+fn update_clip_drag(
+    project: &Project,
+    state: &mut UiState,
+    px_per_tick: f64,
+    pointer: Pos2,
+    lanes_top: f32,
+) {
     let Some(drag) = state.clip_drag else {
         return;
     };
@@ -765,14 +771,22 @@ fn update_clip_drag(project: &Project, state: &mut UiState, px_per_tick: f64, po
         return;
     }
 
-    let delta = (pointer_x - drag.pointer_start_x) as f64 / px_per_tick;
+    let delta = (pointer.x - drag.pointer_start_x) as f64 / px_per_tick;
     let next = match drag.kind {
         ClipDragKind::Move => {
             let start = state.snap.snap_tick(
                 drag.original_start.0 as f64 + delta,
                 project.tempo_map.ppq(),
             );
+            let track_idx = ((pointer.y - lanes_top) / LANE_HEIGHT).floor() as isize;
+            let target_track = if !project.tracks.is_empty() {
+                let clamped_idx = track_idx.clamp(0, (project.tracks.len() - 1) as isize) as usize;
+                project.tracks[clamped_idx].id
+            } else {
+                drag.track
+            };
             ClipDrag {
+                target_track,
                 preview_start: Ticks(start),
                 preview_length: drag.original_length,
                 ..drag
@@ -801,12 +815,24 @@ fn finish_clip_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
     };
     match drag.kind {
         ClipDragKind::Move => {
-            if drag.preview_start != drag.original_start {
+            if drag.preview_start != drag.original_start || drag.target_track != drag.track {
                 actions.push(UiAction::Edit(EditCommand::MoveClip {
                     track: drag.track,
                     clip: drag.clip,
                     start: drag.preview_start,
+                    target_track: if drag.target_track != drag.track {
+                        Some(drag.target_track)
+                    } else {
+                        None
+                    },
                 }));
+                if drag.target_track != drag.track {
+                    state.selected_clip = Some(ClipRef {
+                        track: drag.target_track,
+                        clip: drag.clip,
+                    });
+                    state.selected_track = Some(drag.target_track);
+                }
             }
         }
         ClipDragKind::ResizeEnd => {
@@ -963,8 +989,18 @@ fn draw_track_clips(
         let dragging = state
             .clip_drag
             .filter(|drag| drag.track == track.id && drag.clip == clip.id);
-        let display_start = dragging.map_or(clip.start.0, |drag| drag.preview_start.0);
-        let display_length = dragging.map_or(clip.length.0, |drag| drag.preview_length.0);
+        let is_cross_track = dragging
+            .is_some_and(|drag| drag.kind == ClipDragKind::Move && drag.target_track != track.id);
+        let display_start = if is_cross_track {
+            clip.start.0
+        } else {
+            dragging.map_or(clip.start.0, |drag| drag.preview_start.0)
+        };
+        let display_length = if is_cross_track {
+            clip.length.0
+        } else {
+            dragging.map_or(clip.length.0, |drag| drag.preview_length.0)
+        };
         let x0 = view.tick_to_x(display_start as f64);
         let x1 = view.tick_to_x((display_start + display_length) as f64);
         if x1 < view.left || x0 > right_edge {
@@ -1000,6 +1036,7 @@ fn draw_track_clips(
             state.track_drag = None;
             state.clip_drag = Some(ClipDrag {
                 track: track.id,
+                target_track: track.id,
                 clip: clip.id,
                 kind,
                 pointer_start_x: origin.x,
@@ -1025,6 +1062,17 @@ fn draw_track_clips(
             } else {
                 CursorIcon::Grab
             });
+        }
+
+        if is_cross_track {
+            clip_painter.rect_filled(clip_rect, CornerRadius::same(3), color.gamma_multiply(0.12));
+            clip_painter.rect_stroke(
+                clip_rect,
+                CornerRadius::same(3),
+                Stroke::new(1.0, color.gamma_multiply(0.3)),
+                StrokeKind::Inside,
+            );
+            continue;
         }
 
         let selection = ClipRef {
@@ -1102,6 +1150,59 @@ fn draw_track_clips(
                 clip_rect,
                 CornerRadius::same(3),
                 Stroke::new(1.0, theme::ACCENT),
+                StrokeKind::Inside,
+            );
+        }
+    }
+
+    if let Some(drag) = state.clip_drag
+        && drag.target_track == track.id
+        && drag.target_track != drag.track
+        && let Some(target_pattern) = project
+            .track(drag.track)
+            .and_then(|source_track| source_track.clip(drag.clip))
+            .and_then(|c| project.pattern(c.pattern))
+    {
+        let color = theme::pattern_color(project.pattern_index(target_pattern.id).unwrap_or(0));
+        let x0 = view.tick_to_x(drag.preview_start.0 as f64);
+        let x1 = view.tick_to_x((drag.preview_start.0 + drag.preview_length.0) as f64);
+        if x1 >= view.left && x0 <= right_edge {
+            let clip_rect = Rect::from_min_max(
+                pos2(x0.max(view.left), lane_top + 7.0),
+                pos2(x1.max(x0 + 2.0), lane_bottom - 7.0),
+            );
+            clip_painter.rect_filled(clip_rect, CornerRadius::same(3), color.gamma_multiply(0.35));
+            clip_painter.rect_filled(
+                Rect::from_min_max(
+                    clip_rect.min,
+                    pos2(clip_rect.right(), clip_rect.top() + 16.0),
+                ),
+                CornerRadius {
+                    nw: 3,
+                    ne: 3,
+                    sw: 0,
+                    se: 0,
+                },
+                color.gamma_multiply(0.70),
+            );
+            clip_painter.text(
+                pos2(clip_rect.left() + 6.0, clip_rect.top() + 8.0),
+                Align2::LEFT_CENTER,
+                &target_pattern.name,
+                FontId::proportional(9.5),
+                color,
+            );
+            clip_painter.text(
+                pos2(clip_rect.left() + 4.0, clip_rect.bottom() - 8.0),
+                Align2::LEFT_BOTTOM,
+                format!("{} notes", target_pattern.notes.len()),
+                FontId::proportional(9.0),
+                theme::TEXT_DIM,
+            );
+            clip_painter.rect_stroke(
+                clip_rect,
+                CornerRadius::same(3),
+                Stroke::new(1.5, theme::ACCENT),
                 StrokeKind::Inside,
             );
         }

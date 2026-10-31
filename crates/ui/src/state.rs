@@ -47,6 +47,7 @@ impl SoundfontView {
 pub struct DocumentView {
     pub path: Option<String>,
     pub dirty: bool,
+    pub recent_projects: Vec<PathBuf>,
 }
 
 impl DocumentView {
@@ -90,6 +91,8 @@ pub enum UiAction {
     Redo,
     NewProject,
     OpenProject,
+    OpenRecentProject(PathBuf),
+    ClearRecentProjects,
     SaveProject,
     SaveProjectAs,
     ExportWav,
@@ -269,6 +272,7 @@ pub(crate) enum ClipDragKind {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClipDrag {
     pub track: TrackId,
+    pub target_track: TrackId,
     pub clip: ClipId,
     pub kind: ClipDragKind,
     pub pointer_start_x: f32,

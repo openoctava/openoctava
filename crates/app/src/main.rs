@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod demo;
 
 use std::sync::Arc;
@@ -8,13 +9,14 @@ use eframe::egui;
 use egui::IconData;
 
 fn main() -> eframe::Result {
+    let image = image::load_from_memory(include_bytes!("../assets/OpenOctavaLogo.png"))
+        .expect("Failed to load application icon")
+        .to_rgba8();
+    let (width, height) = image.dimensions();
     let icon = Arc::new(IconData {
-        rgba: image::load_from_memory(include_bytes!("../assets/OpenOctavaLogo.png"))
-            .expect("Cant load icon")
-            .into_rgb8()
-            .into_raw(),
-        width: 512,
-        height: 512,
+        rgba: image.into_raw(),
+        width,
+        height,
     });
 
     let options = eframe::NativeOptions {

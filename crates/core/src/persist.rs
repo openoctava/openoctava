@@ -3,6 +3,8 @@
 //! Projects are stored as a small, versioned JSON envelope so that future
 //! format changes can be detected instead of silently mis-parsed.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -39,6 +41,29 @@ pub fn encode_project(project: &Project) -> Result<String, PersistError> {
     Ok(serde_json::to_string_pretty(&document)?)
 }
 
+/// Serializes a project into the on-disk JSON envelope, making sample and soundfont
+/// paths relative to the project file's directory where applicable.
+pub fn encode_project_at(project: &Project, project_file: &Path) -> Result<String, PersistError> {
+    let mut project = project.clone();
+    let project_dir = project_file.parent().unwrap_or(Path::new("."));
+
+    for track in &mut project.tracks {
+        for sample in &mut track.samples {
+            if let Ok(rel) = sample.path.strip_prefix(project_dir) {
+                sample.path = rel.to_path_buf();
+            }
+        }
+    }
+
+    if let Some(soundfont) = &project.soundfont
+        && let Ok(rel) = soundfont.strip_prefix(project_dir)
+    {
+        project.soundfont = Some(rel.to_path_buf());
+    }
+
+    encode_project(&project)
+}
+
 /// Parses a project written by [`encode_project`].
 pub fn decode_project(text: &str) -> Result<Project, PersistError> {
     let document: ProjectDocument = serde_json::from_str(text)?;
@@ -54,8 +79,51 @@ pub fn decode_project(text: &str) -> Result<Project, PersistError> {
     Ok(document.project)
 }
 
+/// Parses a project written by [`encode_project`], resolving relative sample and
+/// soundfont paths against the project file's directory. If an absolute file path
+/// does not exist on disk, attempts to locate the file in the project's directory.
+pub fn decode_project_at(text: &str, project_file: &Path) -> Result<Project, PersistError> {
+    let mut project = decode_project(text)?;
+    let project_dir = project_file.parent().unwrap_or(Path::new("."));
+
+    for track in &mut project.tracks {
+        for sample in &mut track.samples {
+            if sample.path.is_relative() {
+                sample.path = project_dir.join(&sample.path);
+            } else if !sample.path.exists()
+                && let Some(file_name) = sample.path.file_name()
+            {
+                let local = project_dir.join(file_name);
+                let subfolder = project_dir.join("samples").join(file_name);
+                if local.exists() {
+                    sample.path = local;
+                } else if subfolder.exists() {
+                    sample.path = subfolder;
+                }
+            }
+        }
+    }
+
+    if let Some(soundfont) = &project.soundfont {
+        if soundfont.is_relative() {
+            project.soundfont = Some(project_dir.join(soundfont));
+        } else if !soundfont.exists()
+            && let Some(file_name) = soundfont.file_name()
+        {
+            let local = project_dir.join(file_name);
+            if local.exists() {
+                project.soundfont = Some(local);
+            }
+        }
+    }
+
+    Ok(project)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::time::Ticks;
 
@@ -77,6 +145,27 @@ mod tests {
         assert!(text.contains(PROJECT_FORMAT));
         let restored = decode_project(&text).unwrap();
         assert_eq!(project, restored);
+    }
+
+    #[test]
+    fn round_trips_relative_paths() {
+        let mut project = sample_project();
+        let track_id = project.tracks[0].id;
+        let proj_dir = PathBuf::from("/music/my_song");
+        let proj_file = proj_dir.join("song.octava");
+        let sample_path = proj_dir.join("samples").join("kick.wav");
+
+        project
+            .add_sample(track_id, "Kick", sample_path.clone(), Ticks::ZERO, 1.0, 1.0)
+            .unwrap();
+
+        let encoded = encode_project_at(&project, &proj_file).unwrap();
+        // On-disk path should be relative
+        assert!(encoded.contains("\"path\": \"samples/kick.wav\""));
+
+        let restored = decode_project_at(&encoded, &proj_file).unwrap();
+        // In-memory path should be resolved back to absolute
+        assert_eq!(restored.tracks[0].samples[0].path, sample_path);
     }
 
     #[test]

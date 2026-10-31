@@ -452,6 +452,33 @@ impl Project {
         Ok(id)
     }
 
+    /// Ensures that a pattern is at least `end` ticks long, expanding it to the next
+    /// bar boundary if necessary. Any clip placement whose length previously matched
+    /// the pattern is also expanded to keep the full pattern audible on the timeline.
+    pub fn ensure_pattern_capacity(&mut self, pattern_id: PatternId, end: Ticks) {
+        let Some(pattern) = self.pattern(pattern_id) else {
+            return;
+        };
+        let old_len = pattern.length;
+        if end > old_len {
+            let bar_ticks = self.time_signature.ticks_per_bar(self.tempo_map.ppq());
+            let needed_bars = (end.0 as f64 / bar_ticks as f64).ceil() as u64;
+            let new_len = Ticks((needed_bars * bar_ticks).max(end.0));
+
+            if let Some(pattern) = self.pattern_mut(pattern_id) {
+                pattern.length = new_len;
+            }
+
+            for track in &mut self.tracks {
+                for clip in &mut track.clips {
+                    if clip.pattern == pattern_id && clip.length <= old_len {
+                        clip.length = new_len;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn add_note(
         &mut self,
         pattern_id: PatternId,
@@ -462,12 +489,23 @@ impl Project {
     ) -> Result<NoteId, ModelError> {
         validate_key(key)?;
         validate_velocity(velocity)?;
-        {
-            let pattern = self
-                .pattern(pattern_id)
-                .ok_or(ModelError::PatternNotFound(pattern_id))?;
-            validate_note_geometry(start, length, pattern.length)?;
+        if length == Ticks::ZERO {
+            return Err(ModelError::InvalidNoteLength);
         }
+
+        let end = start.saturating_add(length);
+        let old_len = self
+            .pattern(pattern_id)
+            .ok_or(ModelError::PatternNotFound(pattern_id))?
+            .length;
+        if start >= old_len {
+            self.ensure_pattern_capacity(pattern_id, end);
+        }
+
+        let pattern = self
+            .pattern(pattern_id)
+            .ok_or(ModelError::PatternNotFound(pattern_id))?;
+        validate_note_geometry(start, length, pattern.length)?;
 
         let id = NoteId(self.next_note_id);
         self.next_note_id += 1;
@@ -773,14 +811,30 @@ mod tests {
         );
         assert!(
             project
-                .add_note(pattern, 60, 100, Ticks(960), Ticks(100))
-                .is_err()
-        );
-        assert!(
-            project
                 .add_note(pattern, 60, 100, Ticks::ZERO, Ticks::ZERO)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn notes_expand_pattern_and_clips_past_initial_length() {
+        let mut project = Project::new("Test");
+        let track = project.add_track("Synth").unwrap();
+        let pattern = project.add_pattern("Hook", Ticks(960)).unwrap();
+        let clip = project.add_clip(track, pattern, Ticks::ZERO).unwrap();
+
+        assert_eq!(project.pattern(pattern).unwrap().length, Ticks(960));
+        assert_eq!(
+            project.track(track).unwrap().clip(clip).unwrap().length,
+            Ticks(960)
+        );
+
+        project
+            .add_note(pattern, 60, 100, Ticks(3840), Ticks(960))
+            .unwrap();
+
+        assert!(project.pattern(pattern).unwrap().length >= Ticks(4800));
+        assert!(project.track(track).unwrap().clip(clip).unwrap().length >= Ticks(4800));
     }
 
     #[test]

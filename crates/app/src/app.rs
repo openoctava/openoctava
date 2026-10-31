@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use eframe::egui;
@@ -7,14 +8,15 @@ use octava_audio::{
     AudioEngine, PreviewNote, SoundFontPreset, TransportState, default_soundfont_path, list_presets,
 };
 use octava_core::{
-    EditCommand, PROJECT_EXTENSION, Project, ProjectStore, SampleCache, Ticks, decode_project,
-    encode_project, load_sample, probe_sample,
+    EditCommand, PROJECT_EXTENSION, Project, ProjectStore, SampleCache, Ticks, decode_project_at,
+    encode_project_at, load_sample, probe_sample,
 };
 use octava_render::{RenderSettings, render_wav};
 use octava_ui::{
     DocumentView, FilesView, OctavaUi, PlaybackView, SampleEntry, SoundfontView, UiAction,
 };
 
+use crate::config::AppConfig;
 use crate::demo::demo_project;
 
 const METER_FALLOFF: f32 = 0.82;
@@ -25,6 +27,7 @@ pub struct OctavaApp {
     playback: PlaybackView,
     soundfont: SoundfontView,
     files: FilesView,
+    config: AppConfig,
     /// Decoded WAVs reused across snapshot compilations.
     sample_cache: SampleCache,
     /// Path of the project file, `None` for a project that has never been saved.
@@ -37,11 +40,28 @@ pub struct OctavaApp {
     notice: Option<String>,
     export_open: bool,
     export_path: String,
+    dialog_tx: Sender<DialogMessage>,
+    dialog_rx: Receiver<DialogMessage>,
+}
+
+#[derive(Debug)]
+enum DialogMessage {
+    SaveProjectAs(PathBuf),
+    OpenProject(PathBuf),
+    ChooseSoundfont(PathBuf),
+    OpenSampleFolder(PathBuf),
+    Error(String),
 }
 
 impl OctavaApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         OctavaUi::install_theme(&cc.egui_ctx);
+
+        let config = AppConfig::load();
+        let mut files = FilesView::default();
+        if let Some(folder) = &config.sample_folder {
+            files.folder = Some(folder.display().to_string());
+        }
 
         let store = ProjectStore::new(demo_project());
         let mut playback = PlaybackView::default();
@@ -56,13 +76,15 @@ impl OctavaApp {
             }
         };
         let last_audio_revision = store.revision();
+        let (dialog_tx, dialog_rx) = channel();
 
         let mut app = Self {
             ui: OctavaUi::new(),
             store,
             playback,
             soundfont: SoundfontView::default(),
-            files: FilesView::default(),
+            files,
+            config,
             sample_cache: SampleCache::default(),
             project_path: None,
             loaded_soundfont: None,
@@ -72,8 +94,13 @@ impl OctavaApp {
             notice: None,
             export_open: false,
             export_path: String::new(),
+            dialog_tx,
+            dialog_rx,
         };
         app.refresh_soundfont();
+        if app.files.folder.is_some() {
+            app.refresh_samples();
+        }
         app
     }
 
@@ -187,9 +214,11 @@ impl OctavaApp {
             }
             UiAction::NewProject => self.new_project(ctx),
             UiAction::OpenProject => self.open_project(ctx),
+            UiAction::OpenRecentProject(path) => self.open_project_at_path(path, ctx),
+            UiAction::ClearRecentProjects => self.config.clear_recent(),
             UiAction::SaveProject => self.save_project(ctx),
             UiAction::SaveProjectAs => self.save_project_as(ctx),
-            UiAction::OpenSampleFolder => self.open_sample_folder(),
+            UiAction::OpenSampleFolder => self.open_sample_folder(ctx),
             UiAction::SetSampleFolder(path) => self.load_sample_folder(path),
             UiAction::RefreshSamples => self.refresh_samples(),
             UiAction::AuditionSample(path) => self.audition_sample(path),
@@ -224,12 +253,39 @@ impl OctavaApp {
                 self.export_open = true;
                 self.export_path = default_export_path(self.store.project());
             }
-            UiAction::ChooseSoundfont => self.choose_soundfont(),
+            UiAction::ChooseSoundfont => self.choose_soundfont(ctx),
         }
     }
 
-    /// Opens the desktop's native file picker for SoundFonts.
-    fn choose_soundfont(&mut self) {
+    fn pump_dialogs(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.dialog_rx.try_recv() {
+            match msg {
+                DialogMessage::SaveProjectAs(path) => {
+                    self.write_project(&path);
+                }
+                DialogMessage::OpenProject(path) => {
+                    self.open_project_at_path(path, ctx);
+                }
+                DialogMessage::ChooseSoundfont(path) => {
+                    if let Err(error) = self
+                        .store
+                        .apply(EditCommand::SetSoundfont { path: Some(path) })
+                    {
+                        self.last_error = Some(error.to_string());
+                    }
+                }
+                DialogMessage::OpenSampleFolder(path) => {
+                    self.load_sample_folder(path);
+                }
+                DialogMessage::Error(error) => {
+                    self.last_error = Some(error);
+                }
+            }
+        }
+    }
+
+    /// Opens the desktop's native file picker for SoundFonts on a background thread.
+    fn choose_soundfont(&mut self, ctx: &egui::Context) {
         let mut dialog = rfd::AsyncFileDialog::new()
             .set_title("Choose a SoundFont")
             .add_filter("SoundFont", &["sf2", "sf3"]);
@@ -243,17 +299,25 @@ impl OctavaApp {
             dialog = dialog.set_directory(directory);
         }
 
-        let Some(runtime) = dialog_runtime(&mut self.last_error) else {
-            return;
-        };
-        let Some(file) = runtime.block_on(dialog.pick_file()) else {
-            return;
-        };
-        if let Err(error) = self.store.apply(EditCommand::SetSoundfont {
-            path: Some(file.path().to_path_buf()),
-        }) {
-            self.last_error = Some(error.to_string());
-        }
+        let tx = self.dialog_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(error) => {
+                    let _ = tx.send(DialogMessage::Error(error.to_string()));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            if let Some(file) = runtime.block_on(dialog.pick_file()) {
+                let _ = tx.send(DialogMessage::ChooseSoundfont(file.path().to_path_buf()));
+                ctx.request_repaint();
+            }
+        });
     }
 
     fn open_project(&mut self, ctx: &egui::Context) {
@@ -263,13 +327,29 @@ impl OctavaApp {
         if let Some(directory) = self.project_path.as_deref().and_then(Path::parent) {
             dialog = dialog.set_directory(directory);
         }
-        let Some(runtime) = dialog_runtime(&mut self.last_error) else {
-            return;
-        };
-        let Some(file) = runtime.block_on(dialog.pick_file()) else {
-            return;
-        };
-        let path = file.path().to_path_buf();
+
+        let tx = self.dialog_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(error) => {
+                    let _ = tx.send(DialogMessage::Error(error.to_string()));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            if let Some(file) = runtime.block_on(dialog.pick_file()) {
+                let _ = tx.send(DialogMessage::OpenProject(file.path().to_path_buf()));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn open_project_at_path(&mut self, path: PathBuf, ctx: &egui::Context) {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
@@ -277,7 +357,7 @@ impl OctavaApp {
                 return;
             }
         };
-        let project = match decode_project(&text) {
+        let project = match decode_project_at(&text, &path) {
             Ok(project) => project,
             Err(error) => {
                 self.last_error = Some(format!("Could not open {}: {error}", path.display()));
@@ -288,6 +368,7 @@ impl OctavaApp {
         self.stop_playback(ctx);
         self.store = ProjectStore::new(project);
         self.project_path = Some(path.clone());
+        self.config.add_recent(path.clone());
         self.last_audio_revision = self.store.revision();
         self.sample_cache.clear();
         self.playback.playhead = Ticks::ZERO;
@@ -307,7 +388,7 @@ impl OctavaApp {
         self.write_project(&path);
     }
 
-    fn save_project_as(&mut self, _ctx: &egui::Context) {
+    fn save_project_as(&mut self, ctx: &egui::Context) {
         let mut dialog = rfd::AsyncFileDialog::new()
             .set_title("Save Project As")
             .add_filter("Octava project", &[PROJECT_EXTENSION]);
@@ -324,21 +405,34 @@ impl OctavaApp {
                 slug(&self.store.project().name)
             ));
         }
-        let Some(runtime) = dialog_runtime(&mut self.last_error) else {
-            return;
-        };
-        let Some(file) = runtime.block_on(dialog.save_file()) else {
-            return;
-        };
-        let mut path = file.path().to_path_buf();
-        if path.extension().is_none() {
-            path.set_extension(PROJECT_EXTENSION);
-        }
-        self.write_project(&path);
+
+        let tx = self.dialog_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(error) => {
+                    let _ = tx.send(DialogMessage::Error(error.to_string()));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            if let Some(file) = runtime.block_on(dialog.save_file()) {
+                let mut path = file.path().to_path_buf();
+                if path.extension().is_none() {
+                    path.set_extension(PROJECT_EXTENSION);
+                }
+                let _ = tx.send(DialogMessage::SaveProjectAs(path));
+                ctx.request_repaint();
+            }
+        });
     }
 
     fn write_project(&mut self, path: &Path) {
-        let text = match encode_project(self.store.project()) {
+        let text = match encode_project_at(self.store.project(), path) {
             Ok(text) => text,
             Err(error) => {
                 self.last_error = Some(error.to_string());
@@ -349,6 +443,7 @@ impl OctavaApp {
             Ok(()) => {
                 self.store.mark_saved();
                 self.project_path = Some(path.to_path_buf());
+                self.config.add_recent(path.to_path_buf());
                 self.last_error = None;
                 self.notice = Some(format!("Saved {}", path.display()));
             }
@@ -358,21 +453,35 @@ impl OctavaApp {
         }
     }
 
-    fn open_sample_folder(&mut self) {
+    fn open_sample_folder(&mut self, ctx: &egui::Context) {
         let mut dialog = rfd::AsyncFileDialog::new().set_title("Choose a sample folder");
         if let Some(folder) = &self.files.folder {
             dialog = dialog.set_directory(folder.as_str());
         }
-        let Some(runtime) = dialog_runtime(&mut self.last_error) else {
-            return;
-        };
-        let Some(folder) = runtime.block_on(dialog.pick_folder()) else {
-            return;
-        };
-        self.load_sample_folder(folder.path().to_path_buf());
+
+        let tx = self.dialog_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(error) => {
+                    let _ = tx.send(DialogMessage::Error(error.to_string()));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            if let Some(folder) = runtime.block_on(dialog.pick_folder()) {
+                let _ = tx.send(DialogMessage::OpenSampleFolder(folder.path().to_path_buf()));
+                ctx.request_repaint();
+            }
+        });
     }
 
     fn load_sample_folder(&mut self, folder: PathBuf) {
+        self.config.set_sample_folder(Some(folder.clone()));
         self.files.folder = Some(folder.display().to_string());
         self.sample_cache.clear();
         self.refresh_samples();
@@ -410,6 +519,7 @@ impl OctavaApp {
                 .as_ref()
                 .map(|path| path.display().to_string()),
             dirty: self.store.is_dirty(),
+            recent_projects: self.config.recent_projects.clone(),
         }
     }
 
@@ -594,6 +704,7 @@ fn ui_preset(preset: SoundFontPreset) -> octava_ui::SoundfontPreset {
 impl eframe::App for OctavaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.pump_dialogs(&ctx);
         self.pump_audio(&ctx);
         self.handle_shortcuts(&ctx);
         self.sync_audio_snapshot();
@@ -657,19 +768,71 @@ impl eframe::App for OctavaApp {
     }
 }
 
-fn dialog_runtime(last_error: &mut Option<String>) -> Option<tokio::runtime::Runtime> {
-    // The portal backend runs on zbus, which spawns tasks on a Tokio runtime.
-    // rfd's blocking helper polls the future without one, so drive the async
-    // dialog from a runtime we own instead.
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => Some(runtime),
-        Err(error) => {
-            *last_error = Some(error.to_string());
-            None
-        }
+fn default_export_path(project: &Project) -> String {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(format!("{}.wav", slug(&project.name)))
+        .display()
+        .to_string()
+}
+
+fn export_dialog(
+    ctx: &egui::Context,
+    open: &mut bool,
+    path: &mut String,
+    project: &Project,
+    last_error: &mut Option<String>,
+    notice: &mut Option<String>,
+) {
+    let mut close_requested = false;
+    egui::Window::new("Export WAV")
+        .open(open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label("Output file");
+            ui.add(
+                egui::TextEdit::singleline(path)
+                    .desired_width(420.0)
+                    .hint_text("path/to/output.wav"),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Stereo 16-bit PCM · 44.1 kHz · 1 s release tail")
+                    .size(10.0)
+                    .color(egui::Color32::GRAY),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Render WAV").clicked() {
+                    let mut output = PathBuf::from(path.trim());
+                    if output.as_os_str().is_empty() {
+                        *last_error = Some("Export path must not be empty".to_owned());
+                        return;
+                    }
+                    if output.extension().is_none() {
+                        output.set_extension("wav");
+                    }
+                    *path = output.display().to_string();
+                    match render_wav(project, &output, RenderSettings::default()) {
+                        Ok(()) => {
+                            *notice = Some(format!("Rendered {}", output.display()));
+                            *last_error = None;
+                            close_requested = true;
+                        }
+                        Err(error) => {
+                            *last_error = Some(error.to_string());
+                        }
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    close_requested = true;
+                }
+            });
+        });
+    if close_requested {
+        *open = false;
     }
 }
 
@@ -741,73 +904,5 @@ fn slug(name: &str) -> String {
         "octava".to_owned()
     } else {
         slug.to_owned()
-    }
-}
-
-fn default_export_path(project: &Project) -> String {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(format!("{}.wav", slug(&project.name)))
-        .display()
-        .to_string()
-}
-
-fn export_dialog(
-    ctx: &egui::Context,
-    open: &mut bool,
-    path: &mut String,
-    project: &Project,
-    last_error: &mut Option<String>,
-    notice: &mut Option<String>,
-) {
-    let mut close_requested = false;
-    egui::Window::new("Export WAV")
-        .open(open)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.label("Output file");
-            ui.add(
-                egui::TextEdit::singleline(path)
-                    .desired_width(420.0)
-                    .hint_text("path/to/output.wav"),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Stereo 16-bit PCM · 44.1 kHz · 1 s release tail")
-                    .size(10.0)
-                    .color(egui::Color32::GRAY),
-            );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Render WAV").clicked() {
-                    let mut output = PathBuf::from(path.trim());
-                    if output.as_os_str().is_empty() {
-                        *last_error = Some("Export path must not be empty".to_owned());
-                        return;
-                    }
-                    if output.extension().is_none() {
-                        output.set_extension("wav");
-                    }
-                    *path = output.display().to_string();
-                    match render_wav(project, &output, RenderSettings::default()) {
-                        Ok(()) => {
-                            *notice = Some(format!("Rendered {}", output.display()));
-                            *last_error = None;
-                            close_requested = true;
-                        }
-                        Err(error) => {
-                            *last_error = Some(error.to_string());
-                        }
-                    }
-                }
-                if ui.button("Cancel").clicked() {
-                    close_requested = true;
-                }
-            });
-        });
-    if close_requested {
-        *open = false;
     }
 }

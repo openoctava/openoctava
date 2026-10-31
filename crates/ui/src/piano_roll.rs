@@ -202,7 +202,7 @@ fn handle_input(
     let bar_ticks = project
         .time_signature
         .ticks_per_bar(project.tempo_map.ppq()) as f64;
-    let max_left = pattern.length.0 as f64 + bar_ticks * 8.0;
+    let max_left = (pattern.length.0 as f64).max(bar_ticks * 16.0) + bar_ticks * 16.0;
 
     if response.hovered() {
         let (scroll, zoom, shift, pointer) = ui.input(|input| {
@@ -401,19 +401,14 @@ fn update_note_drag(
     }
 
     let delta_ticks = f64::from(pointer.x - drag.pointer_start.x) / grid.px_per_tick;
-    let pattern_length = pattern.length.0;
 
     let mut next = drag;
     match drag.kind {
         NoteDragKind::Move => {
-            let max_start = pattern_length.saturating_sub(drag.original_length.0);
-            let start = state
-                .snap
-                .snap_tick(
-                    drag.original_start.0 as f64 + delta_ticks,
-                    project.tempo_map.ppq(),
-                )
-                .min(max_start);
+            let start = state.snap.snap_tick(
+                (drag.original_start.0 as f64 + delta_ticks).max(0.0),
+                project.tempo_map.ppq(),
+            );
             next.preview_start = Ticks(start);
             next.preview_length = drag.original_length;
 
@@ -422,12 +417,11 @@ fn update_note_drag(
         }
         NoteDragKind::Resize => {
             let min_end = drag.original_start.0.saturating_add(1);
-            let max_end = pattern_length.max(min_end);
             let original_end = drag.original_start.0 + drag.original_length.0;
             let end = state
                 .snap
                 .snap_tick(original_end as f64 + delta_ticks, project.tempo_map.ppq())
-                .clamp(min_end, max_end);
+                .max(min_end);
             next.preview_start = drag.original_start;
             next.preview_length = Ticks(end - drag.original_start.0);
             next.preview_key = drag.original_key;
@@ -506,7 +500,7 @@ struct PendingNote {
 
 fn pending_note(
     project: &Project,
-    pattern: &Pattern,
+    _pattern: &Pattern,
     grid: &Grid,
     snap: SnapSettings,
     pointer: egui::Pos2,
@@ -520,15 +514,7 @@ fn pending_note(
     // line would place it one cell to the right whenever the click landed in
     // the right half of a cell.
     let tick = snap.snap_tick_floor(grid.x_to_tick(pointer.x), ppq);
-    if tick >= pattern.length.0 {
-        return None;
-    }
-
-    let available = pattern.length.0.saturating_sub(tick);
-    let length = snap.division.ticks(ppq).min(available);
-    if length == 0 {
-        return None;
-    }
+    let length = snap.division.ticks(ppq).max(1);
 
     Some(PendingNote {
         tick,
@@ -1183,5 +1169,30 @@ mod tests {
 
         assert_eq!(pending.tick, step);
         assert!(grid.tick_to_x(pending.tick as f64) <= pointer.x);
+    }
+
+    #[test]
+    fn pending_note_can_start_past_pattern_length() {
+        let mut project = Project::new("test");
+        let ppq = project.tempo_map.ppq();
+        let pattern_id = project
+            .add_pattern("test", Ticks::from_quarters(4.0, ppq))
+            .expect("test pattern is valid");
+        let pattern = project.pattern(pattern_id).expect("pattern was added");
+        let mut grid = test_grid();
+        let snap = SnapSettings::default();
+        let step = snap.division.ticks(ppq);
+
+        // When scrolled forward to bar 2+, the user clicks to place a note at bar 8
+        grid.left_tick = step as f64 * 6.0;
+        let click_tick = step as f64 * 8.0;
+        let pointer = pos2(grid.tick_to_x(click_tick), grid.rect.center().y);
+        assert!(grid.rect.contains(pointer));
+
+        let pending = pending_note(&project, pattern, &grid, snap, pointer)
+            .expect("should allow pending note past pattern length");
+
+        assert_eq!(pending.tick, step * 8);
+        assert_eq!(pending.length, step);
     }
 }
