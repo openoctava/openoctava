@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use crate::model::{Clip, ClipId, Note, NoteId, Pattern, Preset, Project, Track, TrackId};
+use crate::sample::{SampleCache, SampleData};
 use crate::time::{TempoMap, Ticks};
 
 /// Immutable, playback-ready view of a project.
@@ -12,6 +15,19 @@ pub struct PlaybackSnapshot {
     pub length: Ticks,
     pub tracks: Vec<SnapshotTrack>,
     pub events: Vec<TimedEvent>,
+    /// Decoded audio samples sorted by start tick.
+    pub samples: Vec<TimedSample>,
+}
+
+/// A decoded audio clip scheduled on the arrangement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimedSample {
+    pub start: Ticks,
+    pub track: TrackId,
+    /// Combined track and clip gain.
+    pub gain: f32,
+    pub pan: f32,
+    pub data: Arc<SampleData>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -61,9 +77,19 @@ impl EventKind {
 impl Project {
     #[must_use]
     pub fn compile_snapshot(&self) -> PlaybackSnapshot {
+        self.compile_snapshot_with(&mut SampleCache::default())
+    }
+
+    /// Compiles a playback snapshot, decoding sample files through `cache`.
+    ///
+    /// The application keeps a cache alive between edits so that a WAV is only
+    /// read when it is first used.
+    #[must_use]
+    pub fn compile_snapshot_with(&self, cache: &mut SampleCache) -> PlaybackSnapshot {
         let any_solo = self.any_solo();
         let mut tracks = Vec::new();
         let mut events = Vec::with_capacity(self.note_count() * 2);
+        let mut samples = Vec::new();
 
         for track in &self.tracks {
             if !track.is_audible(any_solo) {
@@ -84,7 +110,26 @@ impl Project {
                 };
                 push_clip_events(track, clip, pattern, &mut events);
             }
+
+            for sample in &track.samples {
+                let Some(data) = cache.load(&sample.path) else {
+                    continue;
+                };
+                samples.push(TimedSample {
+                    start: sample.start,
+                    track: track.id,
+                    gain: (track.gain * sample.gain).clamp(0.0, 1.0),
+                    pan: track.pan,
+                    data,
+                });
+            }
         }
+
+        samples.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then_with(|| a.track.0.cmp(&b.track.0))
+        });
 
         events.sort_by(|a, b| {
             a.tick
@@ -103,6 +148,7 @@ impl Project {
             length: self.length_ticks(),
             tracks,
             events,
+            samples,
         }
     }
 }
@@ -294,6 +340,46 @@ mod tests {
         assert_eq!(snapshot.events[0].tick, Ticks(960));
         assert_eq!(snapshot.events[1].tick, Ticks(1200));
         assert_eq!(snapshot.length, Ticks(1200));
+    }
+
+    #[test]
+    fn sample_clips_are_decoded_and_scheduled() {
+        let path =
+            std::env::temp_dir().join(format!("octava-snapshot-sample-{}.wav", std::process::id()));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..24_000 {
+            writer.write_sample(16_384_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut project = Project::new("Samples");
+        let track = project.add_track("Audio").unwrap();
+        let sample = project
+            .add_sample(track, "hit", path.clone(), Ticks(960), 0.5, 0.8)
+            .unwrap();
+        assert_eq!(project.length_ticks(), Ticks(1920));
+        assert_eq!(
+            project.sample_length_ticks(project.track(track).unwrap().sample(sample).unwrap()),
+            Ticks(960)
+        );
+
+        let snapshot = project.compile_snapshot();
+        assert_eq!(snapshot.samples.len(), 1);
+        assert_eq!(snapshot.samples[0].start, Ticks(960));
+        assert_eq!(snapshot.samples[0].track, track);
+        assert!((snapshot.samples[0].gain - 0.8).abs() < 1.0e-6);
+        assert_eq!(snapshot.samples[0].data.frame_count(), 24_000);
+
+        project.track_mut(track).unwrap().mute = true;
+        assert!(project.compile_snapshot().samples.is_empty());
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

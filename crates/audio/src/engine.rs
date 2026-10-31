@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fluidlite::{FontId, IsSettings as _, Settings, Synth};
-use octava_core::{PlaybackSnapshot, Preset, Ticks};
+use octava_core::{PlaybackSnapshot, Preset, SampleData, Ticks};
 use rtrb::{Consumer, Producer, RingBuffer};
 use thiserror::Error;
 
@@ -140,6 +140,7 @@ pub(crate) enum AudioCommand {
     Seek(Ticks),
     SetSnapshot(Arc<PlaybackSnapshot>),
     PreviewNote(PreviewNote),
+    PreviewSample(Arc<SampleData>),
     LoadSoundFont(PathBuf),
 }
 
@@ -260,6 +261,11 @@ impl AudioEngine {
 
     pub fn preview_note(&mut self, note: PreviewNote) -> Result<(), AudioError> {
         self.send(AudioCommand::PreviewNote(note))
+    }
+
+    /// Auditions a decoded sample while the transport is stopped.
+    pub fn preview_sample(&mut self, data: Arc<SampleData>) -> Result<(), AudioError> {
+        self.send(AudioCommand::PreviewSample(data))
     }
 
     /// Swaps the SoundFont used by the synthesizer. The file is patched and

@@ -1,20 +1,35 @@
 mod app;
 mod demo;
 
+use std::sync::Arc;
+
 use app::OctavaApp;
+use eframe::egui;
+use egui::IconData;
 
 fn main() -> eframe::Result {
+    let icon = Arc::new(IconData {
+        rgba: image::load_from_memory(include_bytes!("../assets/OpenOctavaLogo.png"))
+            .expect("Cant load icon")
+            .into_rgb8()
+            .into_raw(),
+        width: 512,
+        height: 512,
+    });
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Octava")
+            .with_title("Open Octava")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([960.0, 600.0])
-            .with_decorations(false),
+            .with_decorations(false)
+            .with_icon(icon)
+            .with_app_id("Open Octava"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Octava",
+        "Open Octava",
         options,
         Box::new(|cc| Ok(Box::new(OctavaApp::new(cc)))),
     )

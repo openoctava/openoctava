@@ -4,6 +4,7 @@
 //! widgets and emits [`UiAction`] values for the application layer to execute.
 
 mod clips;
+mod files;
 mod mixer;
 mod piano_roll;
 mod soundfont_player;
@@ -18,21 +19,33 @@ use egui::{
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 use octava_core::{EditCommand, Project, Ticks};
 
-pub use state::{PlaybackView, SoundfontPreset, SoundfontView, UiAction};
+pub use state::{
+    DocumentView, FilesView, PlaybackView, SampleEntry, SoundfontPreset, SoundfontView, UiAction,
+};
 use state::{RenameTarget, UiState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Clips,
+    Files,
     Timeline,
     PianoRoll,
     Mixer,
 }
 
 impl Tab {
+    const ALL: [Self; 5] = [
+        Self::Clips,
+        Self::Files,
+        Self::Timeline,
+        Self::PianoRoll,
+        Self::Mixer,
+    ];
+
     fn title(self) -> &'static str {
         match self {
             Self::Clips => "Clips",
+            Self::Files => "Files",
             Self::Timeline => "Timeline",
             Self::PianoRoll => "Piano Roll",
             Self::Mixer => "Mixer",
@@ -58,9 +71,11 @@ impl OctavaUi {
     #[must_use]
     pub fn new() -> Self {
         let mut dock = DockState::new(vec![Tab::Timeline]);
-        let [timeline, _clips] =
-            dock.main_surface_mut()
-                .split_left(NodeIndex::root(), 0.18, vec![Tab::Clips]);
+        let [timeline, _library] = dock.main_surface_mut().split_left(
+            NodeIndex::root(),
+            0.18,
+            vec![Tab::Clips, Tab::Files],
+        );
         let _ =
             dock.main_surface_mut()
                 .split_below(timeline, 0.62, vec![Tab::PianoRoll, Tab::Mixer]);
@@ -77,19 +92,42 @@ impl OctavaUi {
         theme::install(ctx);
     }
 
+    /// Drops selections and in-flight edits that referred to the previous
+    /// project. Called after opening a file or creating a new project.
+    pub fn project_replaced(&mut self) {
+        let state = &mut self.state;
+        state.selected_track = None;
+        state.selected_clip = None;
+        state.selected_pattern = None;
+        state.selected_note = None;
+        state.selected_sample = None;
+        state.clipboard = None;
+        state.pending_clip = None;
+        state.note_drag = None;
+        state.clip_drag = None;
+        state.sample_drag = None;
+        state.track_drag = None;
+        state.mixer_drag = None;
+        state.soundfont_player = None;
+        state.rename = None;
+        state.focus_piano_roll = false;
+    }
+
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         project: &Project,
         playback: &PlaybackView,
         soundfont: &SoundfontView,
+        files: &FilesView,
+        document: &DocumentView,
     ) -> Vec<UiAction> {
         self.state.ensure_valid_selection(project);
         let mut actions = Vec::new();
 
-        self.title_bar(ui, project, playback, soundfont, &mut actions);
+        self.title_bar(ui, project, playback, soundfont, document, &mut actions);
         transport_bar(ui, project, playback, &mut self.state, &mut actions);
-        status_bar(ui, project, playback);
+        status_bar(ui, project, playback, document);
 
         let Self {
             dock,
@@ -100,6 +138,7 @@ impl OctavaUi {
             project,
             playback,
             soundfont,
+            files,
             state,
             actions: &mut actions,
         };
@@ -117,7 +156,7 @@ impl OctavaUi {
 
                 DockArea::new(dock)
                     .style(style)
-                    .show_close_buttons(false)
+                    .show_close_buttons(true)
                     .show_add_buttons(false)
                     .show_leaf_close_all_buttons(false)
                     .show_leaf_collapse_buttons(false)
@@ -125,11 +164,14 @@ impl OctavaUi {
                     .show_inside(ui, &mut viewer);
             });
 
-        if self.state.focus_piano_roll
-            && let Some(path) = self.dock.find_tab(&Tab::PianoRoll)
-        {
+        if self.state.focus_piano_roll {
             self.state.focus_piano_roll = false;
-            let _ = self.dock.set_active_tab(path);
+            if self.dock.find_tab(&Tab::PianoRoll).is_none() {
+                self.dock.push_to_focused_leaf(Tab::PianoRoll);
+            }
+            if let Some(path) = self.dock.find_tab(&Tab::PianoRoll) {
+                let _ = self.dock.set_active_tab(path);
+            }
         }
 
         if *show_about {
@@ -148,14 +190,16 @@ impl OctavaUi {
         project: &Project,
         playback: &PlaybackView,
         soundfont: &SoundfontView,
+        document: &DocumentView,
         actions: &mut Vec<UiAction>,
     ) {
         let mut show_about = false;
         let mut reset_layout = false;
-        let mut focus_tab = None;
+        let mut toggle_tab = None;
         let selected_track = self.state.selected_track;
         let selected_pattern = self.state.selected_pattern;
         let selected_note = self.state.selected_note;
+        let open_tabs = Tab::ALL.map(|tab| self.dock.find_tab(&tab).is_some());
 
         egui::Panel::top("octava-titlebar")
             .exact_size(TITLEBAR_HEIGHT)
@@ -201,10 +245,19 @@ impl OctavaUi {
                             actions.push(UiAction::NewProject);
                             ui.close();
                         }
-                        ui.add_enabled(false, egui::Button::new("Open Project…"));
+                        if ui.button("Open Project…    Ctrl+O").clicked() {
+                            actions.push(UiAction::OpenProject);
+                            ui.close();
+                        }
                         ui.separator();
-                        ui.add_enabled(false, egui::Button::new("Save Project"));
-                        ui.add_enabled(false, egui::Button::new("Save Project As…"));
+                        if ui.button("Save Project    Ctrl+S").clicked() {
+                            actions.push(UiAction::SaveProject);
+                            ui.close();
+                        }
+                        if ui.button("Save Project As…    Ctrl+Shift+S").clicked() {
+                            actions.push(UiAction::SaveProjectAs);
+                            ui.close();
+                        }
                     });
 
                     ui.menu_button("Edit", |ui| {
@@ -259,21 +312,17 @@ impl OctavaUi {
                     });
 
                     ui.menu_button("Windows", |ui| {
-                        if ui.button("Clips").clicked() {
-                            focus_tab = Some(Tab::Clips);
-                            ui.close();
-                        }
-                        if ui.button("Timeline").clicked() {
-                            focus_tab = Some(Tab::Timeline);
-                            ui.close();
-                        }
-                        if ui.button("Piano Roll").clicked() {
-                            focus_tab = Some(Tab::PianoRoll);
-                            ui.close();
-                        }
-                        if ui.button("Mixer").clicked() {
-                            focus_tab = Some(Tab::Mixer);
-                            ui.close();
+                        for (index, tab) in Tab::ALL.iter().enumerate() {
+                            let open = open_tabs[index];
+                            let label = if open {
+                                format!("✓ {}", tab.title())
+                            } else {
+                                format!("   {}  (closed)", tab.title())
+                            };
+                            if ui.selectable_label(open, label).clicked() {
+                                toggle_tab = Some(*tab);
+                                ui.close();
+                            }
                         }
                         ui.separator();
                         if ui.button("Reset Layout").clicked() {
@@ -316,11 +365,19 @@ impl OctavaUi {
                     });
 
                     ui.add_space(8.0);
+                    let document_label = document.file_name().map_or_else(
+                        || project.name.clone(),
+                        |name| format!("{}  ·  {name}", project.name),
+                    );
                     ui.label(
-                        RichText::new(&project.name)
+                        RichText::new(document_label)
                             .size(10.5)
                             .color(theme::TEXT_FAINT),
                     );
+                    if document.dirty {
+                        ui.label(RichText::new("●").size(10.5).color(theme::ACCENT))
+                            .on_hover_text("Unsaved changes");
+                    }
 
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
@@ -332,10 +389,15 @@ impl OctavaUi {
         if reset_layout {
             self.dock = Self::new().dock;
         }
-        if let Some(tab) = focus_tab
-            && let Some(path) = self.dock.find_tab(&tab)
-        {
-            let _ = self.dock.set_active_tab(path);
+        if let Some(tab) = toggle_tab {
+            if let Some(path) = self.dock.find_tab(&tab) {
+                let _ = self.dock.set_active_tab(path);
+            } else {
+                self.dock.push_to_focused_leaf(tab);
+                if let Some(path) = self.dock.find_tab(&tab) {
+                    let _ = self.dock.set_active_tab(path);
+                }
+            }
         }
         if show_about {
             self.show_about = true;
@@ -497,6 +559,7 @@ struct WorkspaceViewer<'a> {
     project: &'a Project,
     playback: &'a PlaybackView,
     soundfont: &'a SoundfontView,
+    files: &'a FilesView,
     state: &'a mut UiState,
     actions: &'a mut Vec<UiAction>,
 }
@@ -513,6 +576,16 @@ impl TabViewer for WorkspaceViewer<'_> {
             Tab::Clips => {
                 clips::show(ui, self.project, self.soundfont, self.state, self.actions);
             }
+            Tab::Files => {
+                files::show(
+                    ui,
+                    self.project,
+                    self.playback,
+                    self.files,
+                    self.state,
+                    self.actions,
+                );
+            }
             Tab::Timeline => {
                 timeline::show(ui, self.project, self.playback, self.state, self.actions)
             }
@@ -526,7 +599,7 @@ impl TabViewer for WorkspaceViewer<'_> {
     }
 
     fn is_closeable(&self, _tab: &Self::Tab) -> bool {
-        false
+        true
     }
 }
 
@@ -676,7 +749,12 @@ fn peak_meter(ui: &mut egui::Ui, label: &str, value: f32) {
     );
 }
 
-fn status_bar(ui: &mut egui::Ui, project: &Project, playback: &PlaybackView) {
+fn status_bar(
+    ui: &mut egui::Ui,
+    project: &Project,
+    playback: &PlaybackView,
+    document: &DocumentView,
+) {
     egui::Panel::bottom("octava-status")
         .exact_size(21.0)
         .frame(
@@ -687,11 +765,14 @@ fn status_bar(ui: &mut egui::Ui, project: &Project, playback: &PlaybackView) {
         )
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                let sample_count: usize =
+                    project.tracks.iter().map(|track| track.samples.len()).sum();
                 ui.label(
                     RichText::new(format!(
-                        "{} tracks  ·  {} notes  ·  {} PPQ",
+                        "{} tracks  ·  {} notes  ·  {} samples  ·  {} PPQ",
                         project.tracks.len(),
                         project.note_count(),
+                        sample_count,
                         project.tempo_map.ppq()
                     ))
                     .size(9.5)
@@ -718,6 +799,18 @@ fn status_bar(ui: &mut egui::Ui, project: &Project, playback: &PlaybackView) {
                             .size(9.5)
                             .color(theme::TEXT_FAINT),
                     );
+                    if let Some(path) = &document.path {
+                        ui.label(
+                            RichText::new(if document.dirty { "unsaved" } else { "saved" })
+                                .size(9.5)
+                                .color(if document.dirty {
+                                    theme::ACCENT
+                                } else {
+                                    theme::TEXT_FAINT
+                                }),
+                        );
+                        ui.label(RichText::new(path).size(9.5).color(theme::TEXT_FAINT));
+                    }
                 });
             });
         });

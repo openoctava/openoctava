@@ -16,6 +16,7 @@ octava-render = { path = "crates/render" }
 octava-ui = { path = "crates/ui" }
 
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 
 egui = "0.35"
@@ -29,8 +30,8 @@ hound = "3"
 # Native file dialogs through the desktop portal: no GTK build dependency and
 # the same dialog the rest of the desktop uses on Wayland and X11.
 rfd = { version = "0.14", default-features = false, features = [
-    "xdg-portal",
-    "tokio",
+	"xdg-portal",
+	"tokio",
 ] }
 tokio = { version = "1", features = ["rt"] }
 

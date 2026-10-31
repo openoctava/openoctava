@@ -2,7 +2,7 @@ use egui::{
     Color32, CornerRadius, CursorIcon, Rect, Response, RichText, Sense, Stroke, StrokeKind, pos2,
     vec2,
 };
-use octava_core::{EditCommand, Project, Track, TrackId};
+use octava_core::{EditCommand, EffectKind, Project, Track, TrackId};
 
 use crate::state::{MixerDrag, MixerParam, PlaybackView, UiAction, UiState};
 use crate::theme;
@@ -188,7 +188,10 @@ fn strip(
                     });
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(5.0);
+                effects_section(ui, track, actions);
+
+                ui.add_space(4.0);
                 let fader_height = (ui.available_height() - STRIP_FOOTER).max(MIN_FADER_HEIGHT);
                 ui.horizontal_top(|ui| {
                     let gain = current_value(track.id, MixerParam::Gain, track.gain, state);
@@ -232,6 +235,109 @@ fn strip(
                         .color(theme::TEXT_FAINT),
                 );
             });
+        });
+}
+
+fn effects_section(ui: &mut egui::Ui, track: &Track, actions: &mut Vec<UiAction>) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("FX")
+                .size(8.5)
+                .strong()
+                .color(theme::TEXT_FAINT),
+        )
+        .on_hover_text("Insert effects are placeholders until CLAP support lands");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button(RichText::new("+").size(10.0), |ui| {
+                ui.label(
+                    RichText::new("Insert effect (placeholder)")
+                        .size(9.0)
+                        .color(theme::TEXT_FAINT),
+                );
+                ui.separator();
+                for kind in EffectKind::ALL {
+                    if ui.button(kind.label()).clicked() {
+                        actions.push(UiAction::Edit(EditCommand::AddEffect {
+                            track: track.id,
+                            kind,
+                        }));
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Add an insert effect");
+        });
+    });
+
+    if track.effects.is_empty() {
+        ui.label(
+            RichText::new("No effects")
+                .size(8.5)
+                .color(theme::TEXT_FAINT),
+        );
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .id_salt(("mixer-effects", track.id.0))
+        .max_height(64.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for effect in &track.effects {
+                ui.horizontal(|ui| {
+                    let dot = if effect.bypassed { "○" } else { "●" };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(dot).size(8.5).color(
+                                if effect.bypassed {
+                                    theme::TEXT_FAINT
+                                } else {
+                                    theme::ACCENT
+                                },
+                            ))
+                            .frame(false),
+                        )
+                        .on_hover_text(if effect.bypassed {
+                            "Enable effect"
+                        } else {
+                            "Bypass effect"
+                        })
+                        .clicked()
+                    {
+                        actions.push(UiAction::Edit(EditCommand::SetEffectBypassed {
+                            track: track.id,
+                            effect: effect.id,
+                            bypassed: !effect.bypassed,
+                        }));
+                    }
+                    ui.label(RichText::new(effect.kind.label()).size(8.5).color(
+                        if effect.bypassed {
+                            theme::TEXT_FAINT
+                        } else {
+                            theme::TEXT_DIM
+                        },
+                    ))
+                    .on_hover_text("DSP is not wired up yet");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("×").size(8.5).color(theme::TEXT_FAINT),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Remove effect")
+                            .clicked()
+                        {
+                            actions.push(UiAction::Edit(EditCommand::RemoveEffect {
+                                track: track.id,
+                                effect: effect.id,
+                            }));
+                        }
+                    });
+                });
+            }
         });
 }
 

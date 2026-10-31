@@ -159,6 +159,32 @@ mod tests {
     }
 
     #[test]
+    fn renders_audio_samples_offline() {
+        let data = Arc::new(octava_core::SampleData {
+            sample_rate: 44_100,
+            channels: 1,
+            frames: vec![0.5; 44_100],
+        });
+        let snapshot = PlaybackSnapshot {
+            ppq: 960,
+            tempo_map: octava_core::TempoMap::default(),
+            length: Ticks(1920),
+            tracks: Vec::new(),
+            events: Vec::new(),
+            samples: vec![octava_core::TimedSample {
+                start: Ticks::ZERO,
+                track: octava_core::TrackId(1),
+                gain: 1.0,
+                pan: 0.0,
+                data,
+            }],
+        };
+        let mut renderer = OfflineRenderer::new(44_100).unwrap();
+        let output = renderer.render(Arc::new(snapshot), 0.0).unwrap();
+        assert!(output.iter().any(|sample| sample.abs() > 0.1));
+    }
+
+    #[test]
     fn pan_moves_the_signal_between_channels() {
         let mut project = Project::new("Pan");
         let track = project.add_track("Piano").unwrap();

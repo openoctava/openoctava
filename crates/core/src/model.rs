@@ -41,6 +41,8 @@ id_type!(TrackId);
 id_type!(ClipId);
 id_type!(NoteId);
 id_type!(PatternId);
+id_type!(SampleId);
+id_type!(EffectId);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preset {
@@ -59,6 +61,71 @@ impl std::fmt::Display for Preset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "bank {}, program {}", self.bank, self.program)
     }
+}
+
+/// Kind of an insert effect in a mixer strip.
+///
+/// Effects are stored in the project and shown in the mixer, but no DSP is
+/// wired up yet. This is the placeholder that will later be backed by CLAP
+/// (or another plugin format).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EffectKind {
+    Equalizer,
+    Compressor,
+    Reverb,
+    Delay,
+    Chorus,
+    Distortion,
+    Limiter,
+}
+
+impl EffectKind {
+    pub const ALL: [Self; 7] = [
+        Self::Equalizer,
+        Self::Compressor,
+        Self::Reverb,
+        Self::Delay,
+        Self::Chorus,
+        Self::Distortion,
+        Self::Limiter,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Equalizer => "Equalizer",
+            Self::Compressor => "Compressor",
+            Self::Reverb => "Reverb",
+            Self::Delay => "Delay",
+            Self::Chorus => "Chorus",
+            Self::Distortion => "Distortion",
+            Self::Limiter => "Limiter",
+        }
+    }
+}
+
+/// One insert slot on a track. The slot survives save/load and can be
+/// bypassed, but it does not process audio yet.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EffectSlot {
+    pub id: EffectId,
+    pub kind: EffectKind,
+    pub bypassed: bool,
+}
+
+/// An audio sample placed on a track's timeline.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SampleClip {
+    pub id: SampleId,
+    pub name: String,
+    pub path: PathBuf,
+    /// Absolute start on the arrangement.
+    pub start: Ticks,
+    /// Natural duration in seconds. The tick length is derived from the tempo
+    /// at the clip start, so the drawing follows tempo changes.
+    pub duration: f64,
+    /// Linear clip gain in `0.0..=1.0`.
+    pub gain: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -148,6 +215,12 @@ pub struct Track {
     pub mute: bool,
     pub solo: bool,
     pub clips: Vec<Clip>,
+    /// Insert effects shown in the mixer. No DSP is applied yet.
+    #[serde(default)]
+    pub effects: Vec<EffectSlot>,
+    /// Audio samples placed on the track's timeline.
+    #[serde(default)]
+    pub samples: Vec<SampleClip>,
 }
 
 impl Track {
@@ -162,6 +235,8 @@ impl Track {
             mute: false,
             solo: false,
             clips: Vec::new(),
+            effects: Vec::new(),
+            samples: Vec::new(),
         }
     }
 
@@ -178,6 +253,31 @@ impl Track {
     #[must_use]
     pub fn clip_index(&self, id: ClipId) -> Option<usize> {
         self.clips.iter().position(|clip| clip.id == id)
+    }
+
+    #[must_use]
+    pub fn sample(&self, id: SampleId) -> Option<&SampleClip> {
+        self.samples.iter().find(|sample| sample.id == id)
+    }
+
+    #[must_use]
+    pub fn sample_mut(&mut self, id: SampleId) -> Option<&mut SampleClip> {
+        self.samples.iter_mut().find(|sample| sample.id == id)
+    }
+
+    #[must_use]
+    pub fn sample_index(&self, id: SampleId) -> Option<usize> {
+        self.samples.iter().position(|sample| sample.id == id)
+    }
+
+    #[must_use]
+    pub fn effect(&self, id: EffectId) -> Option<&EffectSlot> {
+        self.effects.iter().find(|effect| effect.id == id)
+    }
+
+    #[must_use]
+    pub fn effect_mut(&mut self, id: EffectId) -> Option<&mut EffectSlot> {
+        self.effects.iter_mut().find(|effect| effect.id == id)
     }
 }
 
@@ -203,6 +303,10 @@ pub struct Project {
     next_note_id: u64,
     #[serde(default = "next_id_default")]
     next_pattern_id: u64,
+    #[serde(default = "next_id_default")]
+    next_sample_id: u64,
+    #[serde(default = "next_id_default")]
+    next_effect_id: u64,
 }
 
 impl Default for Project {
@@ -225,6 +329,8 @@ impl Project {
             next_clip_id: 1,
             next_note_id: 1,
             next_pattern_id: 1,
+            next_sample_id: 1,
+            next_effect_id: 1,
         }
     }
 
@@ -378,20 +484,113 @@ impl Project {
         Ok(id)
     }
 
+    /// Places a decoded audio sample on a track's timeline.
+    pub fn add_sample(
+        &mut self,
+        track_id: TrackId,
+        name: impl Into<String>,
+        path: PathBuf,
+        start: Ticks,
+        duration: f64,
+        gain: f32,
+    ) -> Result<SampleId, ModelError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(ModelError::EmptySampleName);
+        }
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err(ModelError::InvalidSampleDuration);
+        }
+        if !gain.is_finite() || !(0.0..=1.0).contains(&gain) {
+            return Err(ModelError::InvalidSampleGain);
+        }
+
+        let id = SampleId(self.next_sample_id);
+        self.next_sample_id += 1;
+        let track = self
+            .track_mut(track_id)
+            .ok_or(ModelError::TrackNotFound(track_id))?;
+        track.samples.push(SampleClip {
+            id,
+            name: name.trim().to_owned(),
+            path,
+            start,
+            duration,
+            gain,
+        });
+        Ok(id)
+    }
+
+    /// Adds an insert effect placeholder to a track.
+    pub fn add_effect(
+        &mut self,
+        track_id: TrackId,
+        kind: EffectKind,
+    ) -> Result<EffectId, ModelError> {
+        let id = EffectId(self.next_effect_id);
+        self.next_effect_id += 1;
+        let track = self
+            .track_mut(track_id)
+            .ok_or(ModelError::TrackNotFound(track_id))?;
+        track.effects.push(EffectSlot {
+            id,
+            kind,
+            bypassed: false,
+        });
+        Ok(id)
+    }
+
+    /// Converts a duration in seconds into ticks, anchored at `start`.
+    /// Audio does not stretch, so a tempo change after `start` moves the end.
+    #[must_use]
+    pub fn ticks_for_seconds_at(&self, start: Ticks, seconds: f64) -> Ticks {
+        let start_seconds = self.tempo_map.seconds_at(start);
+        Ticks(
+            self.tempo_map
+                .tick_at_seconds(start_seconds + seconds.max(0.0))
+                .0
+                .saturating_sub(start.0),
+        )
+    }
+
+    /// Tick at which a sample clip stops sounding.
+    #[must_use]
+    pub fn sample_end(&self, sample: &SampleClip) -> Ticks {
+        sample
+            .start
+            .saturating_add(self.ticks_for_seconds_at(sample.start, sample.duration))
+    }
+
+    /// Length of the sample clip in ticks at its current tempo.
+    #[must_use]
+    pub fn sample_length_ticks(&self, sample: &SampleClip) -> Ticks {
+        Ticks(self.sample_end(sample).0.saturating_sub(sample.start.0))
+    }
+
     #[must_use]
     pub fn any_solo(&self) -> bool {
         self.tracks.iter().any(|track| track.solo)
     }
 
-    /// Length of the arrangement in ticks, based on the furthest clip end.
+    /// Length of the arrangement in ticks, based on the furthest clip or
+    /// sample end.
     #[must_use]
     pub fn length_ticks(&self) -> Ticks {
-        self.tracks
+        let clip_end = self
+            .tracks
             .iter()
             .flat_map(|track| track.clips.iter())
             .map(Clip::end)
             .max()
-            .unwrap_or(Ticks::ZERO)
+            .unwrap_or(Ticks::ZERO);
+        let sample_end = self
+            .tracks
+            .iter()
+            .flat_map(|track| track.samples.iter())
+            .map(|sample| self.sample_end(sample))
+            .max()
+            .unwrap_or(Ticks::ZERO);
+        clip_end.max(sample_end)
     }
 
     #[must_use]
@@ -486,6 +685,10 @@ pub enum ModelError {
     PatternNotFound(PatternId),
     #[error("note {0} not found")]
     NoteNotFound(NoteId),
+    #[error("sample {0} not found")]
+    SampleNotFound(SampleId),
+    #[error("effect {0} not found")]
+    EffectNotFound(EffectId),
     #[error("all 16 MIDI channels are already in use")]
     NoFreeChannel,
     #[error("MIDI key must be in 0..=127, got {0}")]
@@ -508,6 +711,12 @@ pub enum ModelError {
     InvalidGain,
     #[error("track pan must be in -1.0..=1.0")]
     InvalidPan,
+    #[error("sample name must not be empty")]
+    EmptySampleName,
+    #[error("sample duration must be finite and greater than zero")]
+    InvalidSampleDuration,
+    #[error("sample gain must be finite and in 0.0..=1.0")]
+    InvalidSampleGain,
     #[error("invalid preset: {0}")]
     InvalidPreset(Preset),
     #[error("time signature is invalid")]

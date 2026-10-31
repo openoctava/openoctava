@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,9 +6,14 @@ use eframe::egui;
 use octava_audio::{
     AudioEngine, PreviewNote, SoundFontPreset, TransportState, default_soundfont_path, list_presets,
 };
-use octava_core::{EditCommand, Project, ProjectStore, Ticks};
+use octava_core::{
+    EditCommand, PROJECT_EXTENSION, Project, ProjectStore, SampleCache, Ticks, decode_project,
+    encode_project, load_sample, probe_sample,
+};
 use octava_render::{RenderSettings, render_wav};
-use octava_ui::{OctavaUi, PlaybackView, SoundfontView, UiAction};
+use octava_ui::{
+    DocumentView, FilesView, OctavaUi, PlaybackView, SampleEntry, SoundfontView, UiAction,
+};
 
 use crate::demo::demo_project;
 
@@ -19,6 +24,11 @@ pub struct OctavaApp {
     store: ProjectStore,
     playback: PlaybackView,
     soundfont: SoundfontView,
+    files: FilesView,
+    /// Decoded WAVs reused across snapshot compilations.
+    sample_cache: SampleCache,
+    /// Path of the project file, `None` for a project that has never been saved.
+    project_path: Option<PathBuf>,
     /// SoundFont currently loaded into the synthesizer.
     loaded_soundfont: Option<PathBuf>,
     engine: Option<AudioEngine>,
@@ -52,6 +62,9 @@ impl OctavaApp {
             store,
             playback,
             soundfont: SoundfontView::default(),
+            files: FilesView::default(),
+            sample_cache: SampleCache::default(),
+            project_path: None,
             loaded_soundfont: None,
             engine,
             last_audio_revision,
@@ -103,7 +116,7 @@ impl OctavaApp {
             return;
         }
 
-        let (space, undo, redo) = ctx.input(|input| {
+        let (space, undo, redo, open, save, save_as) = ctx.input(|input| {
             let command = input.modifiers.command;
             let shift = input.modifiers.shift;
             (
@@ -111,9 +124,20 @@ impl OctavaApp {
                 command && !shift && input.key_pressed(egui::Key::Z),
                 (command && shift && input.key_pressed(egui::Key::Z))
                     || (command && input.key_pressed(egui::Key::Y)),
+                command && !shift && input.key_pressed(egui::Key::O),
+                command && !shift && input.key_pressed(egui::Key::S),
+                command && shift && input.key_pressed(egui::Key::S),
             )
         });
 
+        if open {
+            self.open_project(ctx);
+        }
+        if save_as {
+            self.save_project_as(ctx);
+        } else if save {
+            self.save_project(ctx);
+        }
         if space {
             self.toggle_playback(ctx);
         }
@@ -162,6 +186,13 @@ impl OctavaApp {
                 }
             }
             UiAction::NewProject => self.new_project(ctx),
+            UiAction::OpenProject => self.open_project(ctx),
+            UiAction::SaveProject => self.save_project(ctx),
+            UiAction::SaveProjectAs => self.save_project_as(ctx),
+            UiAction::OpenSampleFolder => self.open_sample_folder(),
+            UiAction::SetSampleFolder(path) => self.load_sample_folder(path),
+            UiAction::RefreshSamples => self.refresh_samples(),
+            UiAction::AuditionSample(path) => self.audition_sample(path),
             UiAction::AuditionNote {
                 track,
                 preset,
@@ -212,18 +243,8 @@ impl OctavaApp {
             dialog = dialog.set_directory(directory);
         }
 
-        // The portal backend runs on zbus, which spawns tasks on a Tokio
-        // runtime. rfd's blocking helper polls the future without one, so
-        // drive the async dialog from a runtime we own instead.
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                return;
-            }
+        let Some(runtime) = dialog_runtime(&mut self.last_error) else {
+            return;
         };
         let Some(file) = runtime.block_on(dialog.pick_file()) else {
             return;
@@ -232,6 +253,163 @@ impl OctavaApp {
             path: Some(file.path().to_path_buf()),
         }) {
             self.last_error = Some(error.to_string());
+        }
+    }
+
+    fn open_project(&mut self, ctx: &egui::Context) {
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_title("Open Project")
+            .add_filter("Octava project", &[PROJECT_EXTENSION]);
+        if let Some(directory) = self.project_path.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(runtime) = dialog_runtime(&mut self.last_error) else {
+            return;
+        };
+        let Some(file) = runtime.block_on(dialog.pick_file()) else {
+            return;
+        };
+        let path = file.path().to_path_buf();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.last_error = Some(format!("Could not read {}: {error}", path.display()));
+                return;
+            }
+        };
+        let project = match decode_project(&text) {
+            Ok(project) => project,
+            Err(error) => {
+                self.last_error = Some(format!("Could not open {}: {error}", path.display()));
+                return;
+            }
+        };
+
+        self.stop_playback(ctx);
+        self.store = ProjectStore::new(project);
+        self.project_path = Some(path.clone());
+        self.last_audio_revision = self.store.revision();
+        self.sample_cache.clear();
+        self.playback.playhead = Ticks::ZERO;
+        self.playback.peak_left = 0.0;
+        self.playback.peak_right = 0.0;
+        self.ui.project_replaced();
+        self.last_error = None;
+        self.notice = Some(format!("Opened {}", path.display()));
+        ctx.request_repaint();
+    }
+
+    fn save_project(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.project_path.clone() else {
+            self.save_project_as(ctx);
+            return;
+        };
+        self.write_project(&path);
+    }
+
+    fn save_project_as(&mut self, _ctx: &egui::Context) {
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_title("Save Project As")
+            .add_filter("Octava project", &[PROJECT_EXTENSION]);
+        if let Some(path) = &self.project_path {
+            if let Some(directory) = path.parent() {
+                dialog = dialog.set_directory(directory);
+            }
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                dialog = dialog.set_file_name(name);
+            }
+        } else {
+            dialog = dialog.set_file_name(format!(
+                "{}.{PROJECT_EXTENSION}",
+                slug(&self.store.project().name)
+            ));
+        }
+        let Some(runtime) = dialog_runtime(&mut self.last_error) else {
+            return;
+        };
+        let Some(file) = runtime.block_on(dialog.save_file()) else {
+            return;
+        };
+        let mut path = file.path().to_path_buf();
+        if path.extension().is_none() {
+            path.set_extension(PROJECT_EXTENSION);
+        }
+        self.write_project(&path);
+    }
+
+    fn write_project(&mut self, path: &Path) {
+        let text = match encode_project(self.store.project()) {
+            Ok(text) => text,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return;
+            }
+        };
+        match std::fs::write(path, text) {
+            Ok(()) => {
+                self.store.mark_saved();
+                self.project_path = Some(path.to_path_buf());
+                self.last_error = None;
+                self.notice = Some(format!("Saved {}", path.display()));
+            }
+            Err(error) => {
+                self.last_error = Some(format!("Could not save {}: {error}", path.display()));
+            }
+        }
+    }
+
+    fn open_sample_folder(&mut self) {
+        let mut dialog = rfd::AsyncFileDialog::new().set_title("Choose a sample folder");
+        if let Some(folder) = &self.files.folder {
+            dialog = dialog.set_directory(folder.as_str());
+        }
+        let Some(runtime) = dialog_runtime(&mut self.last_error) else {
+            return;
+        };
+        let Some(folder) = runtime.block_on(dialog.pick_folder()) else {
+            return;
+        };
+        self.load_sample_folder(folder.path().to_path_buf());
+    }
+
+    fn load_sample_folder(&mut self, folder: PathBuf) {
+        self.files.folder = Some(folder.display().to_string());
+        self.sample_cache.clear();
+        self.refresh_samples();
+    }
+
+    fn refresh_samples(&mut self) {
+        let Some(folder) = self.files.folder.clone() else {
+            return;
+        };
+        self.sample_cache.clear();
+        let (entries, error) = scan_sample_folder(Path::new(&folder));
+        self.files.entries = entries;
+        self.files.error = error;
+    }
+
+    fn audition_sample(&mut self, path: PathBuf) {
+        let data = match load_sample(&path) {
+            Ok(data) => Arc::new(data),
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return;
+            }
+        };
+        if let Some(engine) = &mut self.engine
+            && let Err(error) = engine.preview_sample(data)
+        {
+            self.last_error = Some(error.to_string());
+        }
+    }
+
+    fn document_view(&self) -> DocumentView {
+        DocumentView {
+            path: self
+                .project_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            dirty: self.store.is_dirty(),
         }
     }
 
@@ -256,7 +434,10 @@ impl OctavaApp {
             }
         }
         self.store = ProjectStore::new(project);
+        self.project_path = None;
+        self.sample_cache.clear();
         self.last_audio_revision = self.store.revision();
+        self.ui.project_replaced();
         self.last_error = None;
         self.notice = None;
         ctx.request_repaint();
@@ -279,15 +460,26 @@ impl OctavaApp {
             self.playback.playhead = Ticks::ZERO;
         }
 
+        let can_resume = self.engine.as_ref().is_some_and(|engine| {
+            engine.telemetry().state() == TransportState::Paused
+                && self.playback.playhead > Ticks::ZERO
+        });
+        let snapshot = if can_resume {
+            None
+        } else {
+            let snapshot = Arc::new(
+                self.store
+                    .project()
+                    .compile_snapshot_with(&mut self.sample_cache),
+            );
+            self.last_audio_revision = self.store.revision();
+            Some(snapshot)
+        };
+
         if let Some(engine) = &mut self.engine {
-            let can_resume = engine.telemetry().state() == TransportState::Paused
-                && self.playback.playhead > Ticks::ZERO;
-            let result = if can_resume {
-                engine.resume()
-            } else {
-                let snapshot = Arc::new(self.store.project().compile_snapshot());
-                self.last_audio_revision = self.store.revision();
-                engine.play(snapshot, self.playback.playhead)
+            let result = match snapshot {
+                Some(snapshot) => engine.play(snapshot, self.playback.playhead),
+                None => engine.resume(),
             };
             if let Err(error) = result {
                 self.last_error = Some(error.to_string());
@@ -345,18 +537,24 @@ impl OctavaApp {
     }
 
     fn sync_audio_snapshot(&mut self) {
-        let Some(engine) = &mut self.engine else {
+        if self.engine.is_none() {
             return;
-        };
+        }
         let revision = self.store.revision();
         if revision == self.last_audio_revision {
             return;
         }
 
-        let snapshot = Arc::new(self.store.project().compile_snapshot());
-        match engine.set_snapshot(snapshot) {
-            Ok(()) => self.last_audio_revision = revision,
-            Err(error) => self.last_error = Some(error.to_string()),
+        let snapshot = Arc::new(
+            self.store
+                .project()
+                .compile_snapshot_with(&mut self.sample_cache),
+        );
+        if let Some(engine) = &mut self.engine {
+            match engine.set_snapshot(snapshot) {
+                Ok(()) => self.last_audio_revision = revision,
+                Err(error) => self.last_error = Some(error.to_string()),
+            }
         }
     }
 
@@ -401,9 +599,15 @@ impl eframe::App for OctavaApp {
         self.sync_audio_snapshot();
 
         self.sync_soundfont();
-        let actions = self
-            .ui
-            .show(ui, self.store.project(), &self.playback, &self.soundfont);
+        let document = self.document_view();
+        let actions = self.ui.show(
+            ui,
+            self.store.project(),
+            &self.playback,
+            &self.soundfont,
+            &self.files,
+            &document,
+        );
         for action in actions {
             self.handle_action(&ctx, action);
         }
@@ -453,9 +657,73 @@ impl eframe::App for OctavaApp {
     }
 }
 
-fn default_export_path(project: &Project) -> String {
-    let mut slug = project
-        .name
+fn dialog_runtime(last_error: &mut Option<String>) -> Option<tokio::runtime::Runtime> {
+    // The portal backend runs on zbus, which spawns tasks on a Tokio runtime.
+    // rfd's blocking helper polls the future without one, so drive the async
+    // dialog from a runtime we own instead.
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            *last_error = Some(error.to_string());
+            None
+        }
+    }
+}
+
+fn scan_sample_folder(folder: &Path) -> (Vec<SampleEntry>, Option<String>) {
+    let mut entries = Vec::new();
+    let mut failures = 0usize;
+    let directory = match std::fs::read_dir(folder) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return (
+                entries,
+                Some(format!("Could not read {}: {error}", folder.display())),
+            );
+        }
+    };
+
+    for entry in directory.flatten() {
+        let path = entry.path();
+        let is_wav = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
+        if !is_wav || !path.is_file() {
+            continue;
+        }
+        match probe_sample(&path) {
+            Ok(info) => entries.push(SampleEntry {
+                name: path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("sample")
+                    .to_owned(),
+                path,
+                duration_seconds: info.duration_seconds,
+                sample_rate: info.sample_rate,
+                channels: info.channels,
+            }),
+            Err(error) => {
+                failures += 1;
+                eprintln!("Octava: {error}");
+            }
+        }
+        if entries.len() >= 500 {
+            break;
+        }
+    }
+
+    entries.sort_by_key(|entry| entry.name.to_lowercase());
+    let error = (failures > 0).then(|| format!("{failures} WAV file(s) could not be read"));
+    (entries, error)
+}
+
+fn slug(name: &str) -> String {
+    let mut slug = name
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
@@ -469,10 +737,17 @@ fn default_export_path(project: &Project) -> String {
         slug = slug.replace("--", "-");
     }
     let slug = slug.trim_matches('-');
-    let name = if slug.is_empty() { "octava" } else { slug };
+    if slug.is_empty() {
+        "octava".to_owned()
+    } else {
+        slug.to_owned()
+    }
+}
+
+fn default_export_path(project: &Project) -> String {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join(format!("{name}.wav"))
+        .join(format!("{}.wav", slug(&project.name)))
         .display()
         .to_string()
 }

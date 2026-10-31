@@ -516,7 +516,10 @@ fn pending_note(
     }
 
     let ppq = project.tempo_map.ppq();
-    let tick = snap.snap_tick(grid.x_to_tick(pointer.x), ppq);
+    // A new note belongs to the grid cell under the cursor. Using the closest
+    // line would place it one cell to the right whenever the click landed in
+    // the right half of a cell.
+    let tick = snap.snap_tick_floor(grid.x_to_tick(pointer.x), ppq);
     if tick >= pattern.length.0 {
         return None;
     }
@@ -1157,5 +1160,28 @@ mod tests {
             key_at_y(&grid, grid.key_y(key) + grid.key_height - 0.1),
             key
         );
+    }
+
+    #[test]
+    fn pending_note_starts_in_the_cell_under_the_cursor() {
+        let mut project = Project::new("test");
+        let ppq = project.tempo_map.ppq();
+        let pattern_id = project
+            .add_pattern("test", Ticks::from_quarters(4.0, ppq))
+            .expect("test pattern is valid");
+        let pattern = project.pattern(pattern_id).expect("pattern was added");
+        let grid = test_grid();
+        let snap = SnapSettings::default();
+        let step = snap.division.ticks(ppq);
+
+        // Click in the right half of the second cell. Snapping to the closest
+        // line used to jump to the next cell; creation now floors to this one.
+        let click_tick = step as f64 * 1.75;
+        let pointer = pos2(grid.tick_to_x(click_tick), grid.rect.center().y);
+        let pending = pending_note(&project, pattern, &grid, snap, pointer)
+            .expect("the click is inside the pattern");
+
+        assert_eq!(pending.tick, step);
+        assert!(grid.tick_to_x(pending.tick as f64) <= pointer.x);
     }
 }

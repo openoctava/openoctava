@@ -6,7 +6,7 @@ use octava_core::{EditCommand, PatternId, Project, Ticks, Track};
 
 use crate::state::{
     ClipDrag, ClipDragKind, ClipRef, ClipboardClip, PatternDragPayload, PendingClip, PlaybackView,
-    RenameTarget, TrackDrag, UiAction, UiState,
+    RenameTarget, SampleDrag, SampleDragPayload, SampleRef, TrackDrag, UiAction, UiState,
 };
 use crate::theme;
 
@@ -94,6 +94,7 @@ pub(crate) fn show(
 
     if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
         update_clip_drag(project, state, px_per_tick, pointer.x);
+        update_sample_drag(project, state, px_per_tick, pointer.x);
         update_track_drag(project, state, pointer.y, lanes_top, project.tracks.len());
     }
 
@@ -300,6 +301,17 @@ pub(crate) fn show(
             lane_bottom,
             lanes_clip,
         );
+        draw_track_samples(
+            ui,
+            project,
+            track,
+            state,
+            actions,
+            view,
+            lane_top,
+            lane_bottom,
+            lanes_clip,
+        );
     }
 
     let empty_header_rect = Rect::from_min_max(
@@ -411,9 +423,14 @@ pub(crate) fn show(
     handle_pattern_drop(
         ui, project, state, actions, &response, rect, view, lanes_top,
     );
+    // Drop target for WAV samples dragged out of the Files browser.
+    handle_sample_drop(
+        ui, project, state, actions, &response, rect, view, lanes_top,
+    );
 
     if ui.input(|input| input.pointer.any_released()) {
         finish_clip_drag(state, actions);
+        finish_sample_drag(state, actions);
         finish_track_drag(state, actions);
     }
 }
@@ -630,6 +647,76 @@ fn handle_pattern_drop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_sample_drop(
+    ui: &egui::Ui,
+    project: &Project,
+    state: &mut UiState,
+    actions: &mut Vec<UiAction>,
+    response: &egui::Response,
+    rect: Rect,
+    view: View,
+    lanes_top: f32,
+) {
+    let released = response.dnd_release_payload::<SampleDragPayload>();
+    let hovered = response.dnd_hover_payload::<SampleDragPayload>();
+    let Some(payload) = released.as_ref().or(hovered.as_ref()) else {
+        return;
+    };
+    let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) else {
+        return;
+    };
+    if pointer.x < view.left || pointer.y < rect.top() + RULER_HEIGHT {
+        return;
+    }
+
+    let lane = ((pointer.y - lanes_top) / LANE_HEIGHT).floor();
+    if lane < 0.0 || lane as usize >= project.tracks.len() {
+        return;
+    }
+    let Some(track) = project.tracks.get(lane as usize) else {
+        return;
+    };
+    let tick = view.x_to_tick(pointer.x).max(0.0);
+    let start = Ticks(state.snap.snap_tick(tick, project.tempo_map.ppq()));
+    let length = project.ticks_for_seconds_at(start, payload.duration_seconds);
+
+    let x0 = view.tick_to_x(start.0 as f64);
+    let x1 = view.tick_to_x((start.0 + length.0) as f64);
+    let lane_top = lanes_top + lane * LANE_HEIGHT;
+    let ghost = Rect::from_min_max(
+        pos2(x0, lane_top + 5.0),
+        pos2(x1.max(x0 + 4.0), lane_top + LANE_HEIGHT - 5.0),
+    );
+    let painter = ui.painter_at(rect);
+    let color = theme::sample_color();
+    painter.rect_filled(ghost, CornerRadius::same(3), color.gamma_multiply(0.16));
+    painter.rect_stroke(
+        ghost,
+        CornerRadius::same(3),
+        Stroke::new(1.5, color),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        pos2(ghost.left() + 6.0, ghost.top() + 8.0),
+        Align2::LEFT_CENTER,
+        &payload.name,
+        FontId::proportional(9.5),
+        color,
+    );
+
+    if released.is_some() {
+        actions.push(UiAction::Edit(EditCommand::AddSample {
+            track: track.id,
+            name: payload.name.clone(),
+            path: payload.path.clone(),
+            start,
+            duration: payload.duration_seconds,
+            gain: 1.0,
+        }));
+    }
+}
+
 fn update_track_drag(
     project: &Project,
     state: &mut UiState,
@@ -731,6 +818,43 @@ fn finish_clip_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
                 }));
             }
         }
+    }
+}
+
+fn update_sample_drag(project: &Project, state: &mut UiState, px_per_tick: f64, pointer_x: f32) {
+    let Some(drag) = state.sample_drag else {
+        return;
+    };
+    let exists = project
+        .track(drag.track)
+        .and_then(|track| track.sample(drag.sample))
+        .is_some();
+    if !exists {
+        state.sample_drag = None;
+        return;
+    }
+
+    let delta = (pointer_x - drag.pointer_start_x) as f64 / px_per_tick;
+    let start = state.snap.snap_tick(
+        drag.original_start.0 as f64 + delta,
+        project.tempo_map.ppq(),
+    );
+    state.sample_drag = Some(SampleDrag {
+        preview_start: Ticks(start),
+        ..drag
+    });
+}
+
+fn finish_sample_drag(state: &mut UiState, actions: &mut Vec<UiAction>) {
+    let Some(drag) = state.sample_drag.take() else {
+        return;
+    };
+    if drag.preview_start != drag.original_start {
+        actions.push(UiAction::Edit(EditCommand::MoveSample {
+            track: drag.track,
+            sample: drag.sample,
+            start: drag.preview_start,
+        }));
     }
 }
 
@@ -976,6 +1100,156 @@ fn draw_track_clips(
         if selected {
             clip_painter.rect_stroke(
                 clip_rect,
+                CornerRadius::same(3),
+                Stroke::new(1.0, theme::ACCENT),
+                StrokeKind::Inside,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_track_samples(
+    ui: &egui::Ui,
+    project: &Project,
+    track: &Track,
+    state: &mut UiState,
+    actions: &mut Vec<UiAction>,
+    view: View,
+    lane_top: f32,
+    lane_bottom: f32,
+    area: Rect,
+) {
+    if track.samples.is_empty() {
+        return;
+    }
+    let right_edge = ui.max_rect().right();
+    let lane_rect = Rect::from_min_max(pos2(view.left, lane_top), pos2(right_edge, lane_bottom));
+    let painter = ui.painter_at(lane_rect.intersect(area));
+    let color = theme::sample_color();
+
+    for sample in &track.samples {
+        let dragging = state
+            .sample_drag
+            .filter(|drag| drag.track == track.id && drag.sample == sample.id);
+        let display_start = dragging.map_or(sample.start.0, |drag| drag.preview_start.0);
+        let length = project.sample_length_ticks(sample).0.max(1);
+        let x0 = view.tick_to_x(display_start as f64);
+        let x1 = view.tick_to_x((display_start + length) as f64);
+        if x1 < view.left || x0 > right_edge {
+            continue;
+        }
+        let sample_rect = Rect::from_min_max(
+            pos2(x0.max(view.left), lane_top + 5.0),
+            pos2((x1.max(x0 + 2.0)).min(right_edge), lane_bottom - 5.0),
+        );
+        if sample_rect.right() <= view.left {
+            continue;
+        }
+
+        let response = ui.interact(
+            sample_rect.intersect(area),
+            ui.id().with(("timeline-sample", sample.id.0)),
+            Sense::click_and_drag(),
+        );
+        if response.clicked() {
+            state.select_sample(track.id, sample.id);
+        }
+        if response.drag_started() {
+            let origin = ui
+                .input(|input| input.pointer.press_origin())
+                .unwrap_or_else(|| sample_rect.center());
+            state.select_sample(track.id, sample.id);
+            state.track_drag = None;
+            state.clip_drag = None;
+            state.sample_drag = Some(SampleDrag {
+                track: track.id,
+                sample: sample.id,
+                pointer_start_x: origin.x,
+                original_start: sample.start,
+                preview_start: sample.start,
+            });
+        }
+        if dragging.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+
+        let selected = state.selected_sample
+            == Some(SampleRef {
+                track: track.id,
+                sample: sample.id,
+            });
+        response.context_menu(|ui| {
+            if ui.button("Audition").clicked() {
+                actions.push(UiAction::AuditionSample(sample.path.clone()));
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .button(RichText::new("Delete").color(Color32::from_rgb(222, 112, 102)))
+                .clicked()
+            {
+                actions.push(UiAction::Edit(EditCommand::RemoveSample {
+                    track: track.id,
+                    sample: sample.id,
+                }));
+                ui.close();
+            }
+        });
+
+        painter.rect_filled(
+            sample_rect,
+            CornerRadius::same(3),
+            color.gamma_multiply(0.20),
+        );
+        // A lightweight waveform sketch: the UI never decodes the audio itself,
+        // so this is a deterministic placeholder that still reads as a sample.
+        let inner = sample_rect.shrink2(vec2(3.0, 2.0));
+        let steps = (inner.width() / 3.0).floor().max(1.0) as usize;
+        let middle = inner.center().y;
+        let amplitude = (inner.height() * 0.26).max(1.0);
+        for step in 0..steps {
+            let phase = step as f32 * 0.7;
+            let height = amplitude * (0.3 + 0.7 * phase.sin().abs());
+            let x = inner.left() + step as f32 * 3.0;
+            painter.line_segment(
+                [pos2(x, middle - height), pos2(x, middle + height)],
+                Stroke::new(1.0, color.gamma_multiply(0.55)),
+            );
+        }
+        painter.rect_filled(
+            Rect::from_min_max(
+                sample_rect.min,
+                pos2(sample_rect.right(), sample_rect.top() + 15.0),
+            ),
+            CornerRadius {
+                nw: 3,
+                ne: 3,
+                sw: 0,
+                se: 0,
+            },
+            color.gamma_multiply(0.48),
+        );
+        painter.text(
+            pos2(sample_rect.left() + 6.0, sample_rect.top() + 8.0),
+            Align2::LEFT_CENTER,
+            &sample.name,
+            FontId::proportional(9.0),
+            theme::TEXT,
+        );
+        painter.text(
+            pos2(sample_rect.left() + 6.0, sample_rect.bottom() - 6.0),
+            Align2::LEFT_BOTTOM,
+            format!("{:.2}s", sample.duration),
+            FontId::proportional(8.5),
+            theme::TEXT_DIM,
+        );
+
+        if selected {
+            painter.rect_stroke(
+                sample_rect,
                 CornerRadius::same(3),
                 Stroke::new(1.0, theme::ACCENT),
                 StrokeKind::Inside,

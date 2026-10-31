@@ -38,6 +38,12 @@ pub fn pattern_color(index: usize) -> Color32 {
     TRACK_COLORS[(index + 1) % TRACK_COLORS.len()]
 }
 
+/// Colour of an audio sample clip.
+#[must_use]
+pub fn sample_color() -> Color32 {
+    Color32::from_rgb(96, 190, 160)
+}
+
 pub fn install(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = PANEL;

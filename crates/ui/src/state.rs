@@ -1,5 +1,9 @@
+use std::path::PathBuf;
+
 use egui::Pos2;
-use octava_core::{ClipId, EditCommand, NoteId, PatternId, Preset, Project, Ticks, TrackId};
+use octava_core::{
+    ClipId, EditCommand, NoteId, PatternId, Preset, Project, SampleId, Ticks, TrackId,
+};
 
 /// Read-only transport state supplied by the application layer.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -38,6 +42,42 @@ impl SoundfontView {
     }
 }
 
+/// State of the project file shown in the title bar.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocumentView {
+    pub path: Option<String>,
+    pub dirty: bool,
+}
+
+impl DocumentView {
+    #[must_use]
+    pub fn file_name(&self) -> Option<&str> {
+        self.path.as_deref().and_then(|path| {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+        })
+    }
+}
+
+/// One WAV file found in the sample browser folder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SampleEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub duration_seconds: f64,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Sample browser contents supplied by the application layer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FilesView {
+    pub folder: Option<String>,
+    pub entries: Vec<SampleEntry>,
+    pub error: Option<String>,
+}
+
 /// Everything the UI wants the application layer to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiAction {
@@ -49,9 +89,20 @@ pub enum UiAction {
     Undo,
     Redo,
     NewProject,
+    OpenProject,
+    SaveProject,
+    SaveProjectAs,
     ExportWav,
     /// Ask the app shell to open the desktop's native SoundFont picker.
     ChooseSoundfont,
+    /// Ask the app shell to open a folder picker for the sample browser.
+    OpenSampleFolder,
+    /// Load a folder path typed into the Files panel.
+    SetSampleFolder(PathBuf),
+    /// Re-scan the current sample folder and drop cached decodes.
+    RefreshSamples,
+    /// Audition a sample through the audio engine while stopped.
+    AuditionSample(PathBuf),
     AuditionNote {
         track: TrackId,
         preset: Preset,
@@ -126,11 +177,27 @@ impl Default for SnapSettings {
 }
 
 impl SnapSettings {
+    /// Snap to the closest grid line. Dragging and resizing use this so the
+    /// edited edge follows the cursor without lagging behind a whole cell.
     pub fn snap_tick(self, tick: f64, ppq: u16) -> u64 {
         let tick = tick.max(0.0);
         if self.enabled {
             let step = self.division.ticks(ppq) as f64;
             ((tick / step).round() * step) as u64
+        } else {
+            tick.round() as u64
+        }
+    }
+
+    /// Snap down to the grid line at or before `tick`. Note creation uses this
+    /// so a click starts the note in the cell under the cursor: snapping to
+    /// the closest line made clicks in the right half of a cell jump one cell
+    /// to the right.
+    pub fn snap_tick_floor(self, tick: f64, ppq: u16) -> u64 {
+        let tick = tick.max(0.0);
+        if self.enabled {
+            let step = self.division.ticks(ppq) as f64;
+            ((tick / step).floor() * step) as u64
         } else {
             tick.round() as u64
         }
@@ -209,6 +276,30 @@ pub(crate) struct ClipDrag {
     pub original_length: Ticks,
     pub preview_start: Ticks,
     pub preview_length: Ticks,
+}
+
+/// Payload dragged from the Files browser onto the timeline.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SampleDragPayload {
+    pub name: String,
+    pub path: PathBuf,
+    pub duration_seconds: f64,
+}
+
+/// Identifies a sample placement on a track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SampleRef {
+    pub track: TrackId,
+    pub sample: SampleId,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SampleDrag {
+    pub track: TrackId,
+    pub sample: SampleId,
+    pub pointer_start_x: f32,
+    pub original_start: Ticks,
+    pub preview_start: Ticks,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +402,8 @@ pub(crate) struct UiState {
     /// Pattern opened in the piano roll / focused in the clips library.
     pub selected_pattern: Option<PatternId>,
     pub selected_note: Option<NoteRef>,
+    /// Sample placement selected on the timeline.
+    pub selected_sample: Option<SampleRef>,
     pub clipboard: Option<ClipboardClip>,
     pub pending_clip: Option<PendingClip>,
     pub snap: SnapSettings,
@@ -319,6 +412,7 @@ pub(crate) struct UiState {
     pub tempo_drag: Option<TempoDrag>,
     pub note_drag: Option<NoteDrag>,
     pub clip_drag: Option<ClipDrag>,
+    pub sample_drag: Option<SampleDrag>,
     pub track_drag: Option<TrackDrag>,
     pub mixer_drag: Option<MixerDrag>,
     pub focus_piano_roll: bool,
@@ -398,6 +492,26 @@ impl UiState {
             self.clip_drag = None;
         }
 
+        let selected_sample_is_valid = self.selected_sample.is_some_and(|selection| {
+            project
+                .track(selection.track)
+                .and_then(|track| track.sample(selection.sample))
+                .is_some()
+        });
+        if !selected_sample_is_valid {
+            self.selected_sample = None;
+        }
+
+        let sample_drag_is_valid = self.sample_drag.is_some_and(|drag| {
+            project
+                .track(drag.track)
+                .and_then(|track| track.sample(drag.sample))
+                .is_some()
+        });
+        if !sample_drag_is_valid {
+            self.sample_drag = None;
+        }
+
         let track_drag_is_valid = self.track_drag.is_some_and(|drag| {
             project.track(drag.track).is_some()
                 && drag.original_index < project.tracks.len()
@@ -430,6 +544,7 @@ impl UiState {
 
     pub fn select_track(&mut self, project: &Project, id: TrackId) {
         self.selected_track = Some(id);
+        self.selected_sample = None;
         self.selected_clip = project
             .track(id)
             .and_then(|track| track.clips.first())
@@ -454,6 +569,7 @@ impl UiState {
             self.selected_note = None;
         }
         self.selected_track = Some(track);
+        self.selected_sample = None;
         self.selected_clip = Some(selection);
         if let Some(pattern) = project
             .track(track)
@@ -462,6 +578,16 @@ impl UiState {
         {
             self.selected_pattern = Some(pattern);
         }
+    }
+
+    pub fn select_sample(&mut self, track: TrackId, sample: SampleId) {
+        let selection = SampleRef { track, sample };
+        if self.selected_sample != Some(selection) {
+            self.selected_clip = None;
+            self.selected_note = None;
+        }
+        self.selected_track = Some(track);
+        self.selected_sample = Some(selection);
     }
 
     /// Selects a pattern in the clips library. Playback is unaffected: a

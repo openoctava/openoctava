@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    ClipId, ModelError, NoteId, PatternId, Preset, Project, TrackId, validate_note_geometry,
-    validate_preset, validate_velocity,
+    ClipId, EffectId, EffectKind, ModelError, NoteId, PatternId, Preset, Project, SampleId,
+    TrackId, validate_note_geometry, validate_preset, validate_velocity,
 };
 use crate::time::{Ticks, TimeSignature};
 
@@ -114,6 +114,38 @@ pub enum EditCommand {
     SetTimeSignature {
         time_signature: TimeSignature,
     },
+    /// Places a WAV sample on a track's timeline.
+    AddSample {
+        track: TrackId,
+        name: String,
+        path: PathBuf,
+        start: Ticks,
+        duration: f64,
+        gain: f32,
+    },
+    RemoveSample {
+        track: TrackId,
+        sample: SampleId,
+    },
+    MoveSample {
+        track: TrackId,
+        sample: SampleId,
+        start: Ticks,
+    },
+    /// Adds an insert-effect placeholder to a mixer strip.
+    AddEffect {
+        track: TrackId,
+        kind: EffectKind,
+    },
+    RemoveEffect {
+        track: TrackId,
+        effect: EffectId,
+    },
+    SetEffectBypassed {
+        track: TrackId,
+        effect: EffectId,
+        bypassed: bool,
+    },
 }
 
 /// Side effects of a command that the UI may need, such as freshly allocated IDs.
@@ -123,6 +155,8 @@ pub struct EditOutcome {
     pub pattern: Option<PatternId>,
     pub clip: Option<ClipId>,
     pub note: Option<NoteId>,
+    pub sample: Option<SampleId>,
+    pub effect: Option<EffectId>,
     pub removed_notes: usize,
 }
 
@@ -391,6 +425,78 @@ pub(crate) fn apply(
                 return Err(ModelError::InvalidTimeSignature);
             }
             project.time_signature = *time_signature;
+        }
+        EditCommand::AddSample {
+            track,
+            name,
+            path,
+            start,
+            duration,
+            gain,
+        } => {
+            let sample =
+                project.add_sample(*track, name.clone(), path.clone(), *start, *duration, *gain)?;
+            outcome.sample = Some(sample);
+            outcome.track = Some(*track);
+        }
+        EditCommand::RemoveSample { track, sample } => {
+            let stored = project
+                .track_mut(*track)
+                .ok_or(ModelError::TrackNotFound(*track))?;
+            let index = stored
+                .sample_index(*sample)
+                .ok_or(ModelError::SampleNotFound(*sample))?;
+            stored.samples.remove(index);
+            outcome.track = Some(*track);
+            outcome.sample = Some(*sample);
+        }
+        EditCommand::MoveSample {
+            track,
+            sample,
+            start,
+        } => {
+            let stored = project
+                .track_mut(*track)
+                .ok_or(ModelError::TrackNotFound(*track))?;
+            let stored_sample = stored
+                .sample_mut(*sample)
+                .ok_or(ModelError::SampleNotFound(*sample))?;
+            stored_sample.start = *start;
+            outcome.track = Some(*track);
+            outcome.sample = Some(*sample);
+        }
+        EditCommand::AddEffect { track, kind } => {
+            let effect = project.add_effect(*track, *kind)?;
+            outcome.track = Some(*track);
+            outcome.effect = Some(effect);
+        }
+        EditCommand::RemoveEffect { track, effect } => {
+            let stored = project
+                .track_mut(*track)
+                .ok_or(ModelError::TrackNotFound(*track))?;
+            let index = stored
+                .effects
+                .iter()
+                .position(|slot| slot.id == *effect)
+                .ok_or(ModelError::EffectNotFound(*effect))?;
+            stored.effects.remove(index);
+            outcome.track = Some(*track);
+            outcome.effect = Some(*effect);
+        }
+        EditCommand::SetEffectBypassed {
+            track,
+            effect,
+            bypassed,
+        } => {
+            let stored = project
+                .track_mut(*track)
+                .ok_or(ModelError::TrackNotFound(*track))?;
+            let slot = stored
+                .effect_mut(*effect)
+                .ok_or(ModelError::EffectNotFound(*effect))?;
+            slot.bypassed = *bypassed;
+            outcome.track = Some(*track);
+            outcome.effect = Some(*effect);
         }
     }
 

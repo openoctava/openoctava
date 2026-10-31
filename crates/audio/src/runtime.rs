@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use fluidlite::{FontId, Synth};
-use octava_core::{EventKind, PlaybackSnapshot, Preset, Ticks, TimedEvent};
+use octava_core::{EventKind, PlaybackSnapshot, Preset, SampleData, Ticks, TimedEvent};
 use rtrb::{Consumer, Producer};
 
 use crate::engine::{AudioCommand, AudioTelemetry, PreviewNote, TransportState};
@@ -34,6 +34,77 @@ pub(crate) struct Runtime {
     /// Program currently selected on each channel, so that patterns using a
     /// different instrument can switch the channel without redundant calls.
     channel_preset: [Option<Preset>; 16],
+    /// Index of the next sample that has not started yet.
+    sample_index: usize,
+    /// Samples currently being mixed into the output.
+    sample_voices: Vec<SampleVoice>,
+    /// Sample auditioned from the Files panel while the transport is stopped.
+    preview_sample: Option<SampleVoice>,
+}
+
+/// One playing audio sample, with its own resampling position.
+struct SampleVoice {
+    data: Arc<SampleData>,
+    /// Timeline start of the placement this voice belongs to.
+    start: Ticks,
+    /// Position in source frames.
+    position: f64,
+    gain_left: f32,
+    gain_right: f32,
+}
+
+impl SampleVoice {
+    fn new(data: Arc<SampleData>, start: Ticks, gain: f32, pan: f32) -> Self {
+        let gain = gain.clamp(0.0, 1.0);
+        let pan = pan.clamp(-1.0, 1.0);
+        Self {
+            data,
+            start,
+            position: 0.0,
+            gain_left: gain * if pan > 0.0 { 1.0 - pan } else { 1.0 },
+            gain_right: gain * if pan < 0.0 { 1.0 + pan } else { 1.0 },
+        }
+    }
+
+    fn with_offset(
+        data: Arc<SampleData>,
+        start: Ticks,
+        gain: f32,
+        pan: f32,
+        offset_frames: f64,
+    ) -> Self {
+        let mut voice = Self::new(data, start, gain, pan);
+        voice.position = offset_frames.max(0.0);
+        voice
+    }
+
+    fn finished(&self) -> bool {
+        self.position >= self.data.frame_count() as f64
+    }
+
+    fn mix_into(&mut self, left: &mut [f32], right: &mut [f32], step: f64) {
+        let frames = self.data.frame_count();
+        if frames == 0 {
+            self.position = 0.0;
+            return;
+        }
+        let last = frames - 1;
+        let step = step.max(f64::MIN_POSITIVE);
+        let mut position = self.position;
+        for index in 0..left.len() {
+            if position >= frames as f64 {
+                break;
+            }
+            let base = position.floor() as usize;
+            let fraction = (position - base as f64) as f32;
+            let (left_a, right_a) = self.data.stereo_frame(base.min(last));
+            let (left_b, right_b) = self.data.stereo_frame((base + 1).min(last));
+            left[index] += (left_a + (left_b - left_a) * fraction) * self.gain_left;
+            right[index] += (right_a + (right_b - right_a) * fraction) * self.gain_right;
+            position += step;
+        }
+        self.position = position;
+    }
 }
 
 const CHANNELS: usize = 16;
@@ -68,6 +139,9 @@ impl Runtime {
             preview_released: true,
             active: [0; CHANNELS],
             channel_preset: [None; CHANNELS],
+            sample_index: 0,
+            sample_voices: Vec::new(),
+            preview_sample: None,
         };
         runtime.publish();
         runtime
@@ -111,22 +185,36 @@ impl Runtime {
             }
 
             let next_event = snapshot.events.get(self.event_index).copied();
-            let scheduled = next_event.and_then(|event| {
-                let event_seconds = snapshot.tempo_map.seconds_at(event.tick);
+            let next_sample = snapshot.samples.get(self.sample_index);
+            let next = match (next_event, next_sample) {
+                (Some(event), Some(sample)) => {
+                    let event_seconds = snapshot.tempo_map.seconds_at(event.tick);
+                    let sample_seconds = snapshot.tempo_map.seconds_at(sample.start);
+                    if event_seconds <= sample_seconds {
+                        Some((event_seconds, true))
+                    } else {
+                        Some((sample_seconds, false))
+                    }
+                }
+                (Some(event), None) => Some((snapshot.tempo_map.seconds_at(event.tick), true)),
+                (None, Some(sample)) => Some((snapshot.tempo_map.seconds_at(sample.start), false)),
+                (None, None) => None,
+            };
+            let scheduled = next.and_then(|(seconds, is_event)| {
                 // `<=` matters: a note-off that lands exactly on the project
                 // boundary is clamped to `block_end`, and dropping it would
                 // leave the voice sounding through the whole release tail.
-                if event_seconds <= block_end + TICK_EPSILON {
-                    let offset = ((event_seconds - self.position_seconds) * self.sample_rate)
+                if seconds <= block_end + TICK_EPSILON {
+                    let offset = ((seconds - self.position_seconds) * self.sample_rate)
                         .round()
                         .max(0.0) as usize;
-                    Some((offset.min(block_frames), event))
+                    Some((offset.min(block_frames), is_event))
                 } else {
                     None
                 }
             });
 
-            if let Some((offset, event)) = scheduled {
+            if let Some((offset, is_event)) = scheduled {
                 if offset > 0 {
                     self.render_frames(
                         &mut left[rendered..rendered + offset],
@@ -135,8 +223,19 @@ impl Runtime {
                     self.position_seconds += offset as f64 / self.sample_rate;
                     rendered += offset;
                 }
-                self.trigger(event);
-                self.event_index += 1;
+                if is_event {
+                    self.trigger(snapshot.events[self.event_index]);
+                    self.event_index += 1;
+                } else {
+                    let sample = &snapshot.samples[self.sample_index];
+                    self.sample_voices.push(SampleVoice::new(
+                        Arc::clone(&sample.data),
+                        sample.start,
+                        sample.gain,
+                        sample.pan,
+                    ));
+                    self.sample_index += 1;
+                }
             } else {
                 self.render_frames(
                     &mut left[rendered..rendered + block_frames],
@@ -172,6 +271,7 @@ impl Runtime {
 
     pub(crate) fn render_tail(&mut self, left: &mut [f32], right: &mut [f32]) {
         let _ = self.synth.write((&mut *left, &mut *right));
+        self.mix_sample_voices(left, right);
         self.peak_left = peak(left);
         self.peak_right = peak(right);
         self.publish();
@@ -184,8 +284,17 @@ impl Runtime {
         self.active.iter().map(|mask| mask.count_ones()).sum()
     }
 
-    fn render_frames(&self, left: &mut [f32], right: &mut [f32]) {
-        let _ = self.synth.write((left, right));
+    fn render_frames(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let _ = self.synth.write((&mut *left, &mut *right));
+        self.mix_sample_voices(left, right);
+    }
+
+    fn mix_sample_voices(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for voice in &mut self.sample_voices {
+            let step = f64::from(voice.data.sample_rate) / self.sample_rate;
+            voice.mix_into(left, right, step);
+        }
+        self.sample_voices.retain(|voice| !voice.finished());
     }
 
     fn process_commands(&mut self) {
@@ -198,6 +307,7 @@ impl Runtime {
                 AudioCommand::Seek(tick) => self.seek(tick),
                 AudioCommand::SetSnapshot(snapshot) => self.replace_snapshot(snapshot),
                 AudioCommand::PreviewNote(note) => self.preview_note(note),
+                AudioCommand::PreviewSample(data) => self.start_sample_preview(data),
                 AudioCommand::LoadSoundFont(path) => self.load_soundfont(path),
             }
         }
@@ -212,11 +322,43 @@ impl Runtime {
         self.event_index = snapshot.events.partition_point(|event| event.tick < start);
         self.snapshot = Some(snapshot);
         self.reset_synth();
+        self.schedule_samples(start);
         self.state = if self.position_seconds < self.end_seconds - TICK_EPSILON {
             TransportState::Playing
         } else {
             TransportState::Paused
         };
+    }
+
+    /// Clears the sample voices and starts every sample that is already
+    /// sounding at `start` from the correct offset.
+    fn schedule_samples(&mut self, start: Ticks) {
+        self.sample_voices.clear();
+        let Some(snapshot) = self.snapshot.clone() else {
+            self.sample_index = 0;
+            return;
+        };
+        let start_seconds = snapshot.tempo_map.seconds_at(start);
+        self.sample_index = snapshot
+            .samples
+            .partition_point(|sample| sample.start < start);
+        for sample in &snapshot.samples[..self.sample_index] {
+            let sample_start = snapshot.tempo_map.seconds_at(sample.start);
+            let offset_seconds = start_seconds - sample_start;
+            if offset_seconds < 0.0 {
+                continue;
+            }
+            let offset_frames = offset_seconds * f64::from(sample.data.sample_rate);
+            if offset_frames < sample.data.frame_count() as f64 {
+                self.sample_voices.push(SampleVoice::with_offset(
+                    Arc::clone(&sample.data),
+                    sample.start,
+                    sample.gain,
+                    sample.pan,
+                    offset_frames,
+                ));
+            }
+        }
     }
 
     fn resume(&mut self) {
@@ -231,6 +373,8 @@ impl Runtime {
         self.state = TransportState::Stopped;
         self.position_seconds = 0.0;
         self.event_index = 0;
+        self.sample_index = 0;
+        self.sample_voices.clear();
         self.clear_preview();
         self.reset_synth();
     }
@@ -240,6 +384,8 @@ impl Runtime {
         let Some(snapshot) = self.snapshot.clone() else {
             self.position_seconds = 0.0;
             self.event_index = 0;
+            self.sample_index = 0;
+            self.sample_voices.clear();
             self.reset_synth();
             return;
         };
@@ -247,6 +393,7 @@ impl Runtime {
         self.position_seconds = snapshot.tempo_map.seconds_at(tick);
         self.event_index = snapshot.events.partition_point(|event| event.tick < tick);
         self.reset_synth();
+        self.schedule_samples(tick);
         if self.state == TransportState::Playing
             && self.position_seconds >= self.end_seconds - TICK_EPSILON
         {
@@ -264,7 +411,30 @@ impl Runtime {
         self.position_seconds = snapshot.tempo_map.seconds_at(start);
         self.end_seconds = snapshot.tempo_map.seconds_at(snapshot.length);
         self.event_index = event_index;
+        self.sample_index = snapshot
+            .samples
+            .partition_point(|sample| sample.start < start);
+        // Keep samples that are still sounding and still present in the new
+        // snapshot, so that moving a fader does not cut them.
+        let previous = std::mem::take(&mut self.sample_voices);
         self.snapshot = Some(snapshot);
+        let current = self.snapshot.clone();
+        if let Some(snapshot) = current {
+            for voice in previous {
+                let Some(sample) = snapshot.samples.iter().find(|sample| {
+                    sample.start == voice.start && Arc::ptr_eq(&sample.data, &voice.data)
+                }) else {
+                    continue;
+                };
+                self.sample_voices.push(SampleVoice::with_offset(
+                    Arc::clone(&sample.data),
+                    sample.start,
+                    sample.gain,
+                    sample.pan,
+                    voice.position,
+                ));
+            }
+        }
         // Do not reset the synthesizer: edits are applied while playback
         // continues, so the voices that are currently sounding must survive.
         self.sync_channels();
@@ -318,7 +488,7 @@ impl Runtime {
     }
 
     fn render_preview(&mut self, left: &mut [f32], right: &mut [f32]) -> usize {
-        if self.preview_frames == 0 {
+        if self.preview_frames == 0 && self.preview_sample.is_none() {
             left.fill(0.0);
             right.fill(0.0);
             self.peak_left = 0.0;
@@ -327,24 +497,44 @@ impl Runtime {
             return 0;
         }
 
-        let frames = self.preview_frames.min(left.len());
-        self.render_frames(&mut left[..frames], &mut right[..frames]);
-        self.preview_frames -= frames;
+        let frames = if self.preview_frames > 0 {
+            self.preview_frames.min(left.len())
+        } else {
+            0
+        };
+        if frames > 0 {
+            let _ = self
+                .synth
+                .write((&mut left[..frames], &mut right[..frames]));
+            self.preview_frames -= frames;
+            if !self.preview_released && self.preview_frames <= self.preview_note_off_frames {
+                self.preview_released = true;
+                let _ = self.synth.note_off(self.preview_channel, self.preview_key);
+            }
+        }
+        left[frames..].fill(0.0);
+        right[frames..].fill(0.0);
 
-        if !self.preview_released && self.preview_frames <= self.preview_note_off_frames {
-            self.preview_released = true;
-            let _ = self.synth.note_off(self.preview_channel, self.preview_key);
+        if let Some(mut voice) = self.preview_sample.take() {
+            let step = f64::from(voice.data.sample_rate) / self.sample_rate;
+            voice.mix_into(left, right, step);
+            if !voice.finished() {
+                self.preview_sample = Some(voice);
+            }
         }
 
-        if frames < left.len() {
-            left[frames..].fill(0.0);
-            right[frames..].fill(0.0);
-        }
-
-        self.peak_left = peak(&left[..frames]);
-        self.peak_right = peak(&right[..frames]);
+        self.peak_left = peak(left);
+        self.peak_right = peak(right);
         self.publish();
-        frames
+        left.len()
+    }
+
+    fn start_sample_preview(&mut self, data: Arc<SampleData>) {
+        if self.state == TransportState::Playing {
+            return;
+        }
+        self.clear_preview();
+        self.preview_sample = Some(SampleVoice::new(data, Ticks::ZERO, 1.0, 0.0));
     }
 
     fn preview_note(&mut self, note: PreviewNote) {
@@ -383,6 +573,7 @@ impl Runtime {
         self.preview_frames = 0;
         self.preview_note_off_frames = 0;
         self.preview_released = true;
+        self.preview_sample = None;
     }
 
     fn trigger(&mut self, event: TimedEvent) {
@@ -464,6 +655,8 @@ impl Runtime {
             self.trigger(event);
             self.event_index += 1;
         }
+        self.sample_index = snapshot.samples.len();
+        self.sample_voices.clear();
         self.position_seconds = snapshot.tempo_map.seconds_at(snapshot.length);
         self.state = TransportState::Paused;
     }
@@ -676,6 +869,91 @@ mod tests {
             0,
             "deleting a sounding note left its voice hanging"
         );
+    }
+
+    fn sample_snapshot(gain: f32, pan: f32) -> Arc<PlaybackSnapshot> {
+        let data = Arc::new(SampleData {
+            sample_rate: 48_000,
+            channels: 1,
+            frames: vec![0.5; 48_000],
+        });
+        Arc::new(PlaybackSnapshot {
+            ppq: 960,
+            tempo_map: octava_core::TempoMap::default(),
+            length: Ticks(1920),
+            tracks: Vec::new(),
+            events: Vec::new(),
+            samples: vec![octava_core::TimedSample {
+                start: Ticks::ZERO,
+                track: octava_core::TrackId(1),
+                gain,
+                pan,
+                data,
+            }],
+        })
+    }
+
+    #[test]
+    fn plays_audio_samples_with_the_transport() {
+        let mut harness = harness();
+        harness
+            .commands
+            .push(AudioCommand::Play {
+                snapshot: sample_snapshot(1.0, 0.0),
+                start: Ticks::ZERO,
+            })
+            .unwrap();
+
+        render(&mut harness.runtime, 4);
+        assert_eq!(harness.telemetry.state(), TransportState::Playing);
+        let (left, right) = harness.telemetry.peaks();
+        assert!(left > 0.1, "left peak was {left}");
+        assert!(right > 0.1, "right peak was {right}");
+
+        render(&mut harness.runtime, 120);
+        assert_eq!(harness.telemetry.state(), TransportState::Paused);
+        assert!(harness.runtime.sample_voices.is_empty());
+    }
+
+    #[test]
+    fn sample_pan_moves_the_signal() {
+        let mut harness = harness();
+        harness
+            .commands
+            .push(AudioCommand::Play {
+                snapshot: sample_snapshot(1.0, -1.0),
+                start: Ticks::ZERO,
+            })
+            .unwrap();
+        render(&mut harness.runtime, 4);
+        let (left, right) = harness.telemetry.peaks();
+        assert!(left > 0.1);
+        assert!(right < 1.0e-4, "right peak was {right}");
+    }
+
+    #[test]
+    fn previews_a_sample_while_stopped() {
+        let mut harness = harness();
+        let data = Arc::new(SampleData {
+            sample_rate: 48_000,
+            channels: 1,
+            frames: vec![0.25; 48_000],
+        });
+        harness
+            .commands
+            .push(AudioCommand::PreviewSample(data))
+            .unwrap();
+
+        render(&mut harness.runtime, 2);
+        assert_eq!(harness.telemetry.state(), TransportState::Stopped);
+        assert_eq!(harness.telemetry.playhead(), Ticks::ZERO);
+        let (left, right) = harness.telemetry.peaks();
+        assert!(left > 0.1 || right > 0.1);
+
+        render(&mut harness.runtime, 100);
+        let (left, right) = harness.telemetry.peaks();
+        assert_eq!(left, 0.0);
+        assert_eq!(right, 0.0);
     }
 
     #[test]

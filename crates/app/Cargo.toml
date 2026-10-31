@@ -23,3 +23,5 @@ egui.workspace = true
 eframe.workspace = true
 rfd.workspace = true
 tokio.workspace = true
+
+image = "0.25.10"
