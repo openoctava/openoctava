@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use eframe::egui;
 use octava_audio::{
-    AudioEngine, PreviewNote, SoundFontPreset, TransportState, default_soundfont_path, list_presets,
+    AudioEngine, AudioSettingsConfig, PreviewNote, SoundFontPreset, TransportState,
+    default_soundfont_path, list_output_devices, list_presets,
 };
 use octava_core::{
     EditCommand, PROJECT_EXTENSION, Project, ProjectStore, SampleCache, Ticks, decode_project_at,
@@ -13,7 +14,8 @@ use octava_core::{
 };
 use octava_render::{RenderSettings, render_wav};
 use octava_ui::{
-    DocumentView, FilesView, OctavaUi, PlaybackView, SampleEntry, SoundfontView, UiAction,
+    AudioSettingsView, DocumentView, FilesView, OctavaUi, PlaybackView, SampleEntry, SoundfontView,
+    UiAction,
 };
 
 use crate::config::AppConfig;
@@ -28,6 +30,7 @@ pub struct OctavaApp {
     soundfont: SoundfontView,
     files: FilesView,
     config: AppConfig,
+    audio_settings: AudioSettingsView,
     /// Decoded WAVs reused across snapshot compilations.
     sample_cache: SampleCache,
     /// Path of the project file, `None` for a project that has never been saved.
@@ -67,13 +70,35 @@ impl OctavaApp {
 
         let store = ProjectStore::new(demo_project());
         let mut playback = PlaybackView::default();
-        let engine = match AudioEngine::start() {
+        let audio_settings_config = AudioSettingsConfig {
+            device_name: config.audio_device.clone(),
+            buffer_size: config.audio_buffer_size,
+        };
+        let available_devices = list_output_devices();
+        let mut audio_settings = AudioSettingsView {
+            is_online: false,
+            active_device: "None".to_owned(),
+            available_devices,
+            selected_device: config.audio_device.clone(),
+            sample_rate: 0,
+            buffer_size: config.audio_buffer_size,
+            error: None,
+        };
+        let engine = match AudioEngine::start_with_settings(
+            default_soundfont_path(),
+            &audio_settings_config,
+        ) {
             Ok(engine) => {
                 playback.audio_sample_rate = Some(engine.sample_rate());
+                audio_settings.is_online = true;
+                audio_settings.active_device = engine.device_name().to_string();
+                audio_settings.sample_rate = engine.sample_rate();
+                audio_settings.buffer_size = engine.buffer_size();
                 Some(engine)
             }
             Err(error) => {
                 eprintln!("Octava: audio output unavailable: {error}");
+                audio_settings.error = Some(error.to_string());
                 None
             }
         };
@@ -87,6 +112,7 @@ impl OctavaApp {
             soundfont: SoundfontView::default(),
             files,
             config,
+            audio_settings,
             sample_cache: SampleCache::default(),
             project_path: None,
             loaded_soundfont: None,
@@ -257,6 +283,76 @@ impl OctavaApp {
                 self.export_path = default_export_path(self.store.project());
             }
             UiAction::ChooseSoundfont => self.choose_soundfont(ctx),
+            UiAction::OpenAudioSettings => {
+                self.audio_settings.available_devices = list_output_devices();
+            }
+            UiAction::CloseAudioSettings => {}
+            UiAction::SetAudioDevice(device) => {
+                self.config.set_audio_device(device.clone());
+                self.audio_settings.selected_device = device;
+                self.restart_audio_engine();
+            }
+            UiAction::SetAudioBufferSize(size) => {
+                self.config.set_audio_buffer_size(size);
+                self.audio_settings.buffer_size = size;
+                self.restart_audio_engine();
+            }
+            UiAction::RestartAudioEngine => {
+                self.restart_audio_engine();
+            }
+            UiAction::TestAudioTone => {
+                self.play_test_tone();
+            }
+        }
+    }
+
+    fn restart_audio_engine(&mut self) {
+        self.audio_settings.available_devices = list_output_devices();
+        let soundfont_path = self
+            .loaded_soundfont
+            .clone()
+            .unwrap_or_else(default_soundfont_path);
+        let settings = AudioSettingsConfig {
+            device_name: self.config.audio_device.clone(),
+            buffer_size: self.config.audio_buffer_size,
+        };
+        self.engine = None;
+        match AudioEngine::start_with_settings(&soundfont_path, &settings) {
+            Ok(engine) => {
+                self.playback.audio_sample_rate = Some(engine.sample_rate());
+                self.audio_settings.is_online = true;
+                self.audio_settings.active_device = engine.device_name().to_string();
+                self.audio_settings.sample_rate = engine.sample_rate();
+                self.audio_settings.buffer_size = engine.buffer_size();
+                self.audio_settings.error = None;
+                self.engine = Some(engine);
+                self.sync_audio_snapshot();
+            }
+            Err(error) => {
+                self.playback.audio_sample_rate = None;
+                self.audio_settings.is_online = false;
+                self.audio_settings.error = Some(error.to_string());
+                self.last_error = Some(format!("Audio error: {error}"));
+            }
+        }
+    }
+
+    fn play_test_tone(&mut self) {
+        if let Some(engine) = &mut self.engine {
+            let preview = PreviewNote {
+                channel: 0,
+                preset: octava_core::Preset {
+                    bank: 0,
+                    program: 0,
+                },
+                gain: 0.8,
+                pan: 0.0,
+                key: 69,
+                velocity: 100,
+            };
+            if let Err(error) = engine.preview_note(preview) {
+                self.last_error = Some(error.to_string());
+            }
         }
     }
 
@@ -845,6 +941,7 @@ impl eframe::App for OctavaApp {
             &self.soundfont,
             &self.files,
             &document,
+            &self.audio_settings,
         );
         for action in actions {
             self.handle_action(&ctx, action);

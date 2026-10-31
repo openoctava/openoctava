@@ -109,7 +109,7 @@ pub(crate) fn show(
         theme::TEXT_FAINT,
     );
 
-    if ui.input(|input| input.pointer.any_released()) {
+    if ui.input(|input| input.pointer.any_released()) || response.drag_stopped() {
         state.box_select = None;
         finish_note_drag(state, actions);
     }
@@ -281,7 +281,7 @@ fn handle_input(
 
     // Box selection with Ctrl + drag
     if is_ctrl
-        && response.drag_started()
+        && (response.drag_started() || (response.dragged() && state.box_select.is_none()))
         && let Some(origin) = ui.input(|input| input.pointer.press_origin())
         && grid.rect.contains(origin)
     {
@@ -296,13 +296,15 @@ fn handle_input(
             initial_selected,
         });
         if !is_shift {
-            state.deselect_all_notes();
+            state.selected_notes.clear();
+            state.selected_note = None;
         }
     }
 
     if let Some(ref mut box_sel) = state.box_select
         && let Some(pointer) = ui.input(|input| input.pointer.latest_pos())
     {
+        ui.ctx().request_repaint();
         box_sel.current = pointer;
         let min_x = box_sel.start.x.min(box_sel.current.x);
         let max_x = box_sel.start.x.max(box_sel.current.x);

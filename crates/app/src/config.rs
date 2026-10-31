@@ -10,6 +10,10 @@ pub struct AppConfig {
     pub recent_projects: Vec<PathBuf>,
     #[serde(default)]
     pub sample_folder: Option<PathBuf>,
+    #[serde(default)]
+    pub audio_device: Option<String>,
+    #[serde(default)]
+    pub audio_buffer_size: Option<u32>,
 }
 
 impl AppConfig {
@@ -87,6 +91,16 @@ impl AppConfig {
 
     pub fn set_sample_folder(&mut self, folder: Option<PathBuf>) {
         self.sample_folder = folder;
+        self.save();
+    }
+
+    pub fn set_audio_device(&mut self, device: Option<String>) {
+        self.audio_device = device;
+        self.save();
+    }
+
+    pub fn set_audio_buffer_size(&mut self, buffer_size: Option<u32>) {
+        self.audio_buffer_size = buffer_size;
         self.save();
     }
 }

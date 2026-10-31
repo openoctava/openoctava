@@ -3,6 +3,7 @@
 //! The UI never touches audio APIs. It reads [`octava_core::Project`], renders
 //! widgets and emits [`UiAction`] values for the application layer to execute.
 
+mod audio_settings;
 mod clips;
 mod files;
 mod mixer;
@@ -20,7 +21,8 @@ use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 use octava_core::{EditCommand, Project, Ticks};
 
 pub use state::{
-    DocumentView, FilesView, PlaybackView, SampleEntry, SoundfontPreset, SoundfontView, UiAction,
+    AudioSettingsView, DocumentView, FilesView, PlaybackView, SampleEntry, SoundfontPreset,
+    SoundfontView, UiAction,
 };
 use state::{RenameTarget, UiState};
 
@@ -115,6 +117,7 @@ impl OctavaUi {
         state.focus_piano_roll = false;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -123,13 +126,21 @@ impl OctavaUi {
         soundfont: &SoundfontView,
         files: &FilesView,
         document: &DocumentView,
+        audio_settings: &AudioSettingsView,
     ) -> Vec<UiAction> {
         self.state.ensure_valid_selection(project);
         let mut actions = Vec::new();
 
         self.title_bar(ui, project, playback, soundfont, document, &mut actions);
         transport_bar(ui, project, playback, &mut self.state, &mut actions);
-        status_bar(ui, project, playback, document);
+        status_bar(
+            ui,
+            project,
+            playback,
+            document,
+            &mut self.state,
+            &mut actions,
+        );
 
         let Self {
             dock,
@@ -181,6 +192,12 @@ impl OctavaUi {
         }
 
         soundfont_player::show(ui.ctx(), project, soundfont, &mut self.state, &mut actions);
+        audio_settings::show(
+            ui.ctx(),
+            audio_settings,
+            &mut self.state.audio_settings_open,
+            &mut actions,
+        );
         rename_window(ui.ctx(), &mut self.state, &mut actions);
 
         actions
@@ -409,7 +426,11 @@ impl OctavaUi {
                                 .color(theme::TEXT_FAINT),
                         );
                         ui.separator();
-                        ui.add_enabled(false, egui::Button::new("Audio Settings…"));
+                        if ui.button("Audio Settings…").clicked() {
+                            self.state.audio_settings_open = true;
+                            actions.push(UiAction::OpenAudioSettings);
+                            ui.close();
+                        }
                     });
 
                     ui.add_space(8.0);
@@ -802,6 +823,8 @@ fn status_bar(
     project: &Project,
     playback: &PlaybackView,
     document: &DocumentView,
+    state: &mut UiState,
+    actions: &mut Vec<UiAction>,
 ) {
     egui::Panel::bottom("octava-status")
         .exact_size(21.0)
@@ -830,11 +853,25 @@ fn status_bar(
                     || "preview transport · audio engine offline".to_owned(),
                     |rate| format!("audio engine · {rate} Hz"),
                 );
-                ui.label(
-                    RichText::new(format!("· {audio_status}"))
-                        .size(9.5)
-                        .color(theme::TEXT_FAINT),
-                );
+                if ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(format!("· {audio_status}")).size(9.5).color(
+                                if playback.audio_sample_rate.is_some() {
+                                    theme::TEXT_FAINT
+                                } else {
+                                    egui::Color32::from_rgb(218, 92, 82)
+                                },
+                            ),
+                        )
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_text("Click to open Audio Settings")
+                    .clicked()
+                {
+                    state.audio_settings_open = true;
+                    actions.push(UiAction::OpenAudioSettings);
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let state = if playback.playing {

@@ -80,6 +80,18 @@ pub struct FilesView {
     pub error: Option<String>,
 }
 
+/// Audio settings and status supplied by the application layer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioSettingsView {
+    pub is_online: bool,
+    pub active_device: String,
+    pub available_devices: Vec<String>,
+    pub selected_device: Option<String>,
+    pub sample_rate: u32,
+    pub buffer_size: Option<u32>,
+    pub error: Option<String>,
+}
+
 /// Everything the UI wants the application layer to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiAction {
@@ -113,6 +125,18 @@ pub enum UiAction {
         key: u8,
         velocity: u8,
     },
+    /// Open the audio settings modal window.
+    OpenAudioSettings,
+    /// Close the audio settings modal window.
+    CloseAudioSettings,
+    /// Select a specific output device or system default.
+    SetAudioDevice(Option<String>),
+    /// Select a specific audio buffer size or device default.
+    SetAudioBufferSize(Option<u32>),
+    /// Restart the audio engine with current settings.
+    RestartAudioEngine,
+    /// Play a test tone (A4 440 Hz) to verify sound output.
+    TestAudioTone,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -442,6 +466,7 @@ pub(crate) struct UiState {
     pub track_drag: Option<TrackDrag>,
     pub mixer_drag: Option<MixerDrag>,
     pub focus_piano_roll: bool,
+    pub audio_settings_open: bool,
     /// Pattern whose SoundFont player window is open.
     pub soundfont_player: Option<PatternId>,
     pub rename: Option<RenameState>,
@@ -627,6 +652,41 @@ impl UiState {
     pub fn deselect_all_notes(&mut self) {
         self.selected_note = None;
         self.selected_notes.clear();
-        self.box_select = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octava_core::{NoteId, PatternId};
+
+    #[test]
+    fn deselect_all_notes_does_not_clear_box_select() {
+        let mut state = UiState::default();
+        let note = NoteRef {
+            pattern: PatternId(1),
+            note: NoteId(1),
+        };
+        state.select_note(note, false);
+        state.box_select = Some(BoxSelect {
+            start: Pos2::new(10.0, 10.0),
+            current: Pos2::new(50.0, 50.0),
+            initial_selected: BTreeSet::new(),
+        });
+
+        state.deselect_all_notes();
+
+        assert!(state.selected_notes.is_empty());
+        assert_eq!(state.selected_note, None);
+        assert!(state.box_select.is_some());
+    }
+
+    #[test]
+    fn audio_settings_view_defaults() {
+        let view = AudioSettingsView::default();
+        assert!(!view.is_online);
+        assert_eq!(view.sample_rate, 0);
+        assert!(view.available_devices.is_empty());
+        assert_eq!(view.buffer_size, None);
     }
 }

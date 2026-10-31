@@ -129,6 +129,12 @@ pub struct PreviewNote {
     pub velocity: u8,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioSettingsConfig {
+    pub device_name: Option<String>,
+    pub buffer_size: Option<u32>,
+}
+
 pub(crate) enum AudioCommand {
     Play {
         snapshot: Arc<PlaybackSnapshot>,
@@ -150,6 +156,27 @@ pub struct AudioEngine {
     garbage: Consumer<Arc<PlaybackSnapshot>>,
     telemetry: Arc<AudioTelemetry>,
     device_name: String,
+    buffer_size: Option<u32>,
+}
+
+/// Enumerates the output device names reported by CPAL.
+#[must_use]
+pub fn list_output_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    let Ok(devices) = host.output_devices() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for dev in devices {
+        let name = dev.description().map_or_else(
+            |_| String::new(),
+            |description| description.name().to_owned(),
+        );
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 impl AudioEngine {
@@ -158,10 +185,34 @@ impl AudioEngine {
     }
 
     pub fn start_with_soundfont(path: impl AsRef<Path>) -> Result<Self, AudioError> {
+        Self::start_with_settings(path, &AudioSettingsConfig::default())
+    }
+
+    pub fn start_with_settings(
+        path: impl AsRef<Path>,
+        settings: &AudioSettingsConfig,
+    ) -> Result<Self, AudioError> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or(AudioError::NoOutputDevice)?;
+        let device = if let Some(ref target) = settings.device_name {
+            let mut matched = None;
+            if let Ok(devices) = host.output_devices() {
+                for dev in devices {
+                    let name = dev.description().map_or_else(
+                        |_| String::new(),
+                        |description| description.name().to_owned(),
+                    );
+                    if &name == target {
+                        matched = Some(dev);
+                        break;
+                    }
+                }
+            }
+            matched.or_else(|| host.default_output_device())
+        } else {
+            host.default_output_device()
+        }
+        .ok_or(AudioError::NoOutputDevice)?;
+
         let device_name = device.description().map_or_else(
             |_| "default output".to_owned(),
             |description| description.name().to_owned(),
@@ -170,7 +221,11 @@ impl AudioEngine {
             .default_output_config()
             .map_err(|error| AudioError::Device(error.to_string()))?;
         let sample_format = supported.sample_format();
-        let config = supported.config();
+        let mut config = supported.config();
+        let requested_buffer_size = settings.buffer_size;
+        if let Some(frames) = requested_buffer_size {
+            config.buffer_size = cpal::BufferSize::Fixed(frames);
+        }
         let sample_rate = config.sample_rate;
 
         let (synth, font_id) = create_synth(path.as_ref(), sample_rate)?;
@@ -209,6 +264,7 @@ impl AudioEngine {
             garbage: garbage_consumer,
             telemetry,
             device_name,
+            buffer_size: requested_buffer_size,
         })
     }
 
@@ -220,6 +276,11 @@ impl AudioEngine {
     #[must_use]
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    #[must_use]
+    pub fn buffer_size(&self) -> Option<u32> {
+        self.buffer_size
     }
 
     #[must_use]
@@ -368,4 +429,21 @@ where
             None,
         )
         .map_err(|error| AudioError::Device(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_output_devices_does_not_panic() {
+        let _ = list_output_devices();
+    }
+
+    #[test]
+    fn audio_settings_config_defaults() {
+        let config = AudioSettingsConfig::default();
+        assert_eq!(config.device_name, None);
+        assert_eq!(config.buffer_size, None);
+    }
 }

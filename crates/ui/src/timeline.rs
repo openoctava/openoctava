@@ -2,7 +2,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, RichText, Sense, Stroke,
     StrokeKind, Vec2, pos2, vec2,
 };
-use octava_core::{EditCommand, PatternId, Project, Ticks, Track};
+use octava_core::{EditCommand, Pattern, PatternId, Project, Ticks, Track};
 
 use crate::state::{
     ClipDrag, ClipDragKind, ClipRef, ClipboardClip, PatternDragPayload, PendingClip, PlaybackView,
@@ -641,6 +641,15 @@ fn handle_pattern_drop(
         FontId::proportional(9.5),
         theme::ACCENT,
     );
+    draw_clip_notes(
+        &clip_painter,
+        ghost,
+        pattern,
+        start.0,
+        pattern.length.0,
+        theme::ACCENT,
+        view,
+    );
 
     if released.is_some() {
         place_clip(state, actions, track.id, pattern.id, start);
@@ -1137,13 +1146,25 @@ fn draw_track_clips(
             FontId::proportional(9.5),
             color,
         );
-        clip_painter.text(
-            pos2(clip_rect.left() + 4.0, clip_rect.bottom() - 8.0),
-            Align2::LEFT_BOTTOM,
-            format!("{} notes", pattern.notes.len()),
-            FontId::proportional(9.0),
-            theme::TEXT_DIM,
-        );
+        if pattern.notes.is_empty() {
+            clip_painter.text(
+                pos2(clip_rect.left() + 4.0, clip_rect.bottom() - 8.0),
+                Align2::LEFT_BOTTOM,
+                "0 notes",
+                FontId::proportional(9.0),
+                theme::TEXT_DIM,
+            );
+        } else {
+            draw_clip_notes(
+                &clip_painter,
+                clip_rect,
+                pattern,
+                display_start,
+                display_length,
+                color,
+                view,
+            );
+        }
 
         if selected {
             clip_painter.rect_stroke(
@@ -1192,19 +1213,80 @@ fn draw_track_clips(
                 FontId::proportional(9.5),
                 color,
             );
-            clip_painter.text(
-                pos2(clip_rect.left() + 4.0, clip_rect.bottom() - 8.0),
-                Align2::LEFT_BOTTOM,
-                format!("{} notes", target_pattern.notes.len()),
-                FontId::proportional(9.0),
-                theme::TEXT_DIM,
-            );
+            if target_pattern.notes.is_empty() {
+                clip_painter.text(
+                    pos2(clip_rect.left() + 4.0, clip_rect.bottom() - 8.0),
+                    Align2::LEFT_BOTTOM,
+                    "0 notes",
+                    FontId::proportional(9.0),
+                    theme::TEXT_DIM,
+                );
+            } else {
+                draw_clip_notes(
+                    &clip_painter,
+                    clip_rect,
+                    target_pattern,
+                    drag.preview_start.0,
+                    drag.preview_length.0,
+                    color,
+                    view,
+                );
+            }
             clip_painter.rect_stroke(
                 clip_rect,
                 CornerRadius::same(3),
                 Stroke::new(1.5, theme::ACCENT),
                 StrokeKind::Inside,
             );
+        }
+    }
+}
+
+fn draw_clip_notes(
+    painter: &egui::Painter,
+    clip_rect: Rect,
+    pattern: &Pattern,
+    display_start: u64,
+    display_length: u64,
+    color: Color32,
+    view: View,
+) {
+    if pattern.notes.is_empty() || display_length == 0 {
+        return;
+    }
+    let note_area_top = clip_rect.top() + 18.0;
+    let note_area_bottom = clip_rect.bottom() - 3.0;
+    let note_area_height = (note_area_bottom - note_area_top).max(2.0);
+
+    let (min_key, max_key) = pattern.notes.iter().fold((127u8, 0u8), |(min, max), n| {
+        (min.min(n.key), max.max(n.key))
+    });
+    let center_key = (min_key as f32 + max_key as f32) / 2.0;
+    let half_span = ((max_key as f32 - min_key as f32) / 2.0).max(6.0);
+    let pitch_min = (center_key - half_span).clamp(0.0, 127.0);
+    let pitch_max = (center_key + half_span).clamp(0.0, 127.0);
+    let span = (pitch_max - pitch_min).max(1.0);
+
+    let note_color = color.gamma_multiply(0.85);
+
+    for note in &pattern.notes {
+        if note.start.0 >= display_length {
+            continue;
+        }
+        let note_tick_start = display_start + note.start.0;
+        let note_tick_end = display_start + (note.start.0 + note.length.0).min(display_length);
+        let x0 = view.tick_to_x(note_tick_start as f64);
+        let x1 = view.tick_to_x(note_tick_end as f64);
+
+        let norm_pitch = ((note.key as f32 - pitch_min) / span).clamp(0.0, 1.0);
+        let note_h = (note_area_height / span).clamp(1.5, 3.5);
+        let note_y = note_area_bottom - norm_pitch * (note_area_height - note_h) - note_h;
+
+        let note_rect =
+            Rect::from_min_max(pos2(x0, note_y), pos2(x1.max(x0 + 1.5), note_y + note_h));
+        let visible = note_rect.intersect(clip_rect);
+        if visible.is_positive() {
+            painter.rect_filled(visible, CornerRadius::same(1), note_color);
         }
     }
 }

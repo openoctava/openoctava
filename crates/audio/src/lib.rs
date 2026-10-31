@@ -12,6 +12,9 @@ mod offline;
 mod runtime;
 mod soundfont;
 
-pub use engine::{AudioEngine, AudioError, AudioTelemetry, PreviewNote, TransportState};
+pub use engine::{
+    AudioEngine, AudioError, AudioSettingsConfig, AudioTelemetry, PreviewNote, TransportState,
+    list_output_devices,
+};
 pub use offline::OfflineRenderer;
 pub use soundfont::{SoundFontError, SoundFontPreset, default_soundfont_path, list_presets};
