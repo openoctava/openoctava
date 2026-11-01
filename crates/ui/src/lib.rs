@@ -107,6 +107,8 @@ impl OctavaUi {
         state.selected_sample = None;
         state.clipboard = None;
         state.pending_clip = None;
+        state.note_clipboard = None;
+        state.pending_notes = None;
         state.note_drag = None;
         state.clip_drag = None;
         state.sample_drag = None;
@@ -340,6 +342,28 @@ impl OctavaUi {
                             }));
                             ui.close();
                         }
+                        let has_selected_clip = self.state.selected_clip.is_some()
+                            || self.state.selected_sample.is_some();
+                        if ui
+                            .add_enabled(
+                                has_selected_clip,
+                                egui::Button::new("Delete Selected Clip/Sample    Del"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(selection) = self.state.selected_clip.take() {
+                                actions.push(UiAction::Edit(EditCommand::RemoveClip {
+                                    track: selection.track,
+                                    clip: selection.clip,
+                                }));
+                            } else if let Some(selection) = self.state.selected_sample.take() {
+                                actions.push(UiAction::Edit(EditCommand::RemoveSample {
+                                    track: selection.track,
+                                    sample: selection.sample,
+                                }));
+                            }
+                            ui.close();
+                        }
                         if ui
                             .add_enabled(
                                 has_selected_notes,
@@ -436,7 +460,17 @@ impl OctavaUi {
                     ui.add_space(8.0);
                     let document_label = document.file_name().map_or_else(
                         || project.name.clone(),
-                        |name| format!("{}  ·  {name}", project.name),
+                        |name| {
+                            let stem = std::path::Path::new(name)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(name);
+                            if project.name == stem || project.name == name {
+                                name.to_owned()
+                            } else {
+                                format!("{}  ·  {name}", project.name)
+                            }
+                        },
                     );
                     ui.label(
                         RichText::new(document_label)

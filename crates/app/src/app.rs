@@ -519,13 +519,20 @@ impl OctavaApp {
                 return;
             }
         };
-        let project = match decode_project_at(&text, &path) {
+        let mut project = match decode_project_at(&text, &path) {
             Ok(project) => project,
             Err(error) => {
                 self.last_error = Some(format!("Could not open {}: {error}", path.display()));
                 return;
             }
         };
+
+        if project.name == "Untitled"
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && !stem.is_empty()
+        {
+            project.name = stem.to_owned();
+        }
 
         self.stop_playback(ctx);
         self.store = ProjectStore::new(project);
@@ -629,6 +636,13 @@ impl OctavaApp {
     }
 
     fn write_project(&mut self, path: &Path) {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && !stem.is_empty()
+            && (self.store.project().name == "Untitled"
+                || self.project_path.as_deref() != Some(path))
+        {
+            self.store.set_project_name(stem);
+        }
         let text = match encode_project_at(self.store.project(), path) {
             Ok(text) => text,
             Err(error) => {

@@ -260,6 +260,29 @@ pub(crate) struct ClipboardClip {
     pub length: Ticks,
 }
 
+/// Clipboard entry for notes in the piano roll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClipboardNote {
+    pub tick_offset: u64,
+    pub length: Ticks,
+    pub key: u8,
+    pub velocity: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NoteClipboard {
+    pub pattern: PatternId,
+    pub span: u64,
+    pub last_end: u64,
+    pub notes: Vec<ClipboardNote>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingNotes {
+    pub pattern: PatternId,
+    pub notes: Vec<(Ticks, Ticks, u8)>,
+}
+
 /// A clip placement the UI just asked the app layer to create. Once the
 /// command lands, the next frame selects it so that repeated Ctrl+D chains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -456,6 +479,8 @@ pub(crate) struct UiState {
     pub selected_sample: Option<SampleRef>,
     pub clipboard: Option<ClipboardClip>,
     pub pending_clip: Option<PendingClip>,
+    pub note_clipboard: Option<NoteClipboard>,
+    pub pending_notes: Option<PendingNotes>,
     pub snap: SnapSettings,
     pub piano_roll: PianoRollState,
     pub timeline: TimelineState,
@@ -481,6 +506,21 @@ impl UiState {
             self.selected_track = project.tracks.first().map(|track| track.id);
         }
 
+        if let Some(pending) = self.pending_clip
+            && let Some(track) = project.track(pending.track)
+            && let Some(clip) = track
+                .clips
+                .iter()
+                .rev()
+                .find(|c| c.pattern == pending.pattern && c.start == pending.start)
+        {
+            self.selected_clip = Some(ClipRef {
+                track: pending.track,
+                clip: clip.id,
+            });
+            self.pending_clip = None;
+        }
+
         let selected_clip_is_valid = self.selected_clip.is_some_and(|selection| {
             project
                 .track(selection.track)
@@ -501,6 +541,28 @@ impl UiState {
                 .and_then(|track| track.clip(self.selected_clip?.clip))
                 .map(|clip| clip.pattern)
                 .or_else(|| project.patterns.first().map(|pattern| pattern.id));
+        }
+
+        if let Some(pending) = self.pending_notes.take()
+            && let Some(pattern) = project.pattern(pending.pattern)
+        {
+            let mut new_selection = BTreeSet::new();
+            let mut used = std::collections::HashSet::new();
+            for (start, length, key) in pending.notes {
+                if let Some(n) = pattern.notes.iter().find(|n| {
+                    !used.contains(&n.id) && n.start == start && n.length == length && n.key == key
+                }) {
+                    used.insert(n.id);
+                    new_selection.insert(NoteRef {
+                        pattern: pending.pattern,
+                        note: n.id,
+                    });
+                }
+            }
+            if !new_selection.is_empty() {
+                self.selected_notes = new_selection;
+                self.selected_note = self.selected_notes.iter().copied().next();
+            }
         }
 
         self.selected_notes.retain(|selection| {

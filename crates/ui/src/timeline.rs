@@ -90,7 +90,7 @@ pub(crate) fn show(
     let last_lane = (((state.timeline.scroll_y + lane_viewport) / LANE_HEIGHT).ceil() as usize)
         .min(project.tracks.len());
 
-    handle_shortcuts(ui, project, playback, state, actions);
+    handle_shortcuts(ui, project, playback, state, actions, &response);
 
     if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
         update_clip_drag(project, state, px_per_tick, pointer, lanes_top);
@@ -522,19 +522,41 @@ fn handle_shortcuts(
     playback: &PlaybackView,
     state: &mut UiState,
     actions: &mut Vec<UiAction>,
+    response: &egui::Response,
 ) {
     if ui.ctx().egui_wants_keyboard_input() {
         return;
     }
 
     let (copy, paste, duplicate) = ui.input(|input| {
-        let command = input.modifiers.command;
+        let command = input.modifiers.command || input.modifiers.ctrl;
         (
             command && input.key_pressed(egui::Key::C),
             command && input.key_pressed(egui::Key::V),
             command && input.key_pressed(egui::Key::D),
         )
     });
+
+    let delete = ui.input(|input| {
+        input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
+    });
+
+    if delete
+        && (response.hovered()
+            || (state.selected_notes.is_empty() && state.selected_note.is_none()))
+    {
+        if let Some(selection) = state.selected_clip.take() {
+            actions.push(UiAction::Edit(EditCommand::RemoveClip {
+                track: selection.track,
+                clip: selection.clip,
+            }));
+        } else if let Some(selection) = state.selected_sample.take() {
+            actions.push(UiAction::Edit(EditCommand::RemoveSample {
+                track: selection.track,
+                sample: selection.sample,
+            }));
+        }
+    }
 
     if copy
         && let Some(selection) = state.selected_clip

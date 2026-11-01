@@ -35,6 +35,11 @@ impl ProjectStore {
         &self.project
     }
 
+    pub fn set_project_name(&mut self, name: impl Into<String>) {
+        self.project.name = name.into();
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub fn set_undo_limit(&mut self, limit: usize) {
         self.undo_limit = limit;
         self.trim_undo();
@@ -195,5 +200,14 @@ mod tests {
         assert!(store.undo());
         assert!(store.undo());
         assert!(!store.undo());
+    }
+
+    #[test]
+    fn set_project_name_updates_name_and_bumps_revision() {
+        let mut store = ProjectStore::new(Project::new("Untitled"));
+        let rev = store.revision();
+        store.set_project_name("My Track");
+        assert_eq!(store.project().name, "My Track");
+        assert_eq!(store.revision(), rev + 1);
     }
 }

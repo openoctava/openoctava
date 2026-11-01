@@ -5,9 +5,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     ClipId, EffectId, EffectKind, ModelError, NoteId, PatternId, Preset, Project, SampleId,
-    TrackId, validate_note_geometry, validate_preset, validate_velocity,
+    TrackId, validate_key, validate_note_geometry, validate_preset, validate_velocity,
 };
 use crate::time::{Ticks, TimeSignature};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewNote {
+    pub key: u8,
+    pub velocity: u8,
+    pub start: Ticks,
+    pub length: Ticks,
+}
 
 /// A single user-visible project mutation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,6 +94,10 @@ pub enum EditCommand {
         velocity: u8,
         start: Ticks,
         length: Ticks,
+    },
+    AddNotes {
+        pattern: PatternId,
+        notes: Vec<NewNote>,
     },
     RemoveNotes {
         pattern: PatternId,
@@ -336,6 +348,28 @@ pub(crate) fn apply(
         } => {
             let note = project.add_note(*pattern, *key, *velocity, *start, *length)?;
             outcome.note = Some(note);
+            outcome.pattern = Some(*pattern);
+        }
+        EditCommand::AddNotes { pattern, notes } => {
+            if notes.is_empty() {
+                return Ok(outcome);
+            }
+            for note in notes {
+                validate_key(note.key)?;
+                validate_velocity(note.velocity)?;
+                if note.length == Ticks::ZERO {
+                    return Err(ModelError::InvalidNoteLength);
+                }
+            }
+            let mut first_id = None;
+            for note in notes {
+                let id =
+                    project.add_note(*pattern, note.key, note.velocity, note.start, note.length)?;
+                if first_id.is_none() {
+                    first_id = Some(id);
+                }
+            }
+            outcome.note = first_id;
             outcome.pattern = Some(*pattern);
         }
         EditCommand::RemoveNotes { pattern, notes } => {
@@ -1169,5 +1203,40 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn add_notes_batch_adds_and_supports_undo() {
+        let (mut store, _track, pattern, _clip) = fixture();
+        let notes = vec![
+            NewNote {
+                key: 60,
+                velocity: 100,
+                start: Ticks(0),
+                length: Ticks(240),
+            },
+            NewNote {
+                key: 64,
+                velocity: 100,
+                start: Ticks(240),
+                length: Ticks(240),
+            },
+        ];
+
+        let outcome = store
+            .apply(EditCommand::AddNotes { pattern, notes })
+            .unwrap();
+
+        assert_eq!(outcome.pattern, Some(pattern));
+        assert!(outcome.note.is_some());
+        assert_eq!(store.project().pattern(pattern).unwrap().notes.len(), 2);
+
+        // Undo in a single step removes both notes
+        store.undo();
+        assert_eq!(store.project().pattern(pattern).unwrap().notes.len(), 0);
+
+        // Redo restores both notes
+        store.redo();
+        assert_eq!(store.project().pattern(pattern).unwrap().notes.len(), 2);
     }
 }

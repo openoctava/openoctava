@@ -104,7 +104,7 @@ pub(crate) fn show(
     ui.painter_at(rect).text(
         pos2(rect.right() - 8.0, rect.bottom() - 6.0),
         Align2::RIGHT_BOTTOM,
-        "click: add note  ·  Shift+click: select  ·  Ctrl+drag: box select  ·  drag: move  ·  drag edge: resize  ·  right-click/Del: delete",
+        "click: add note  ·  Shift+click: select  ·  Ctrl+drag: box select  ·  Ctrl+C/V: copy/paste  ·  Ctrl+D: duplicate  ·  right-click/Del: delete",
         FontId::proportional(9.5),
         theme::TEXT_FAINT,
     );
@@ -264,11 +264,14 @@ fn handle_input(
         state.box_select = None;
     }
 
+    let gutter_rect = Rect::from_min_max(
+        pos2(grid.rect.left() - GUTTER_WIDTH, grid.rect.top()),
+        pos2(grid.rect.left(), grid.rect.bottom()),
+    );
+
     if ui.input(|input| input.pointer.primary_pressed())
         && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
-        && pointer.x < grid.rect.left()
-        && pointer.y >= grid.rect.top()
-        && pointer.y <= grid.rect.bottom()
+        && gutter_rect.contains(pointer)
         && let Some(track) = audition_track
     {
         actions.push(UiAction::AuditionNote {
@@ -487,13 +490,35 @@ fn handle_input(
         }
     }
 
-    if response.hovered()
-        && !ui.ctx().egui_wants_keyboard_input()
-        && ui.input(|input| {
-            input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
-        })
-    {
-        delete_selected_notes(state, actions);
+    let (copy, paste, duplicate) = ui.input(|input| {
+        let command = input.modifiers.command || input.modifiers.ctrl;
+        (
+            command && input.key_pressed(egui::Key::C),
+            command && input.key_pressed(egui::Key::V),
+            command && input.key_pressed(egui::Key::D),
+        )
+    });
+
+    let in_piano_roll =
+        response.hovered() || (!state.selected_notes.is_empty() && state.selected_clip.is_none());
+    if in_piano_roll && !ui.ctx().egui_wants_keyboard_input() {
+        if copy {
+            copy_selected_notes(pattern, state);
+        }
+        if paste {
+            let pointer = ui.input(|input| input.pointer.hover_pos());
+            paste_notes(project, pattern, grid, state, actions, pointer);
+        }
+        if duplicate {
+            duplicate_selected_notes(pattern, state, actions);
+        }
+        if response.hovered()
+            && ui.input(|input| {
+                input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
+            })
+        {
+            delete_selected_notes(state, actions);
+        }
     }
 }
 
@@ -650,6 +675,200 @@ fn delete_selected_notes(state: &mut UiState, actions: &mut Vec<UiAction>) {
     for (pattern, notes) in pattern_notes {
         actions.push(UiAction::Edit(EditCommand::RemoveNotes { pattern, notes }));
     }
+}
+
+fn copy_selected_notes(pattern: &Pattern, state: &mut UiState) {
+    let mut selected_notes_data = Vec::new();
+    for note_ref in &state.selected_notes {
+        if note_ref.pattern == pattern.id
+            && let Some(note) = pattern.note(note_ref.note)
+        {
+            selected_notes_data.push(note.clone());
+        }
+    }
+    if selected_notes_data.is_empty()
+        && let Some(sel) = state.selected_note
+        && sel.pattern == pattern.id
+        && let Some(note) = pattern.note(sel.note)
+    {
+        selected_notes_data.push(note.clone());
+    }
+
+    if selected_notes_data.is_empty() {
+        return;
+    }
+
+    let min_start = selected_notes_data
+        .iter()
+        .map(|n| n.start.0)
+        .min()
+        .unwrap_or(0);
+    let max_end = selected_notes_data
+        .iter()
+        .map(|n| n.start.0 + n.length.0)
+        .max()
+        .unwrap_or(0);
+    let span = max_end.saturating_sub(min_start);
+
+    state.note_clipboard = Some(crate::state::NoteClipboard {
+        pattern: pattern.id,
+        span,
+        last_end: max_end,
+        notes: selected_notes_data
+            .iter()
+            .map(|n| crate::state::ClipboardNote {
+                tick_offset: n.start.0.saturating_sub(min_start),
+                length: n.length,
+                key: n.key,
+                velocity: n.velocity,
+            })
+            .collect(),
+    });
+}
+
+fn duplicate_selected_notes(pattern: &Pattern, state: &mut UiState, actions: &mut Vec<UiAction>) {
+    let mut selected_notes_data = Vec::new();
+    for note_ref in &state.selected_notes {
+        if note_ref.pattern == pattern.id
+            && let Some(note) = pattern.note(note_ref.note)
+        {
+            selected_notes_data.push(note.clone());
+        }
+    }
+    if selected_notes_data.is_empty()
+        && let Some(sel) = state.selected_note
+        && sel.pattern == pattern.id
+        && let Some(note) = pattern.note(sel.note)
+    {
+        selected_notes_data.push(note.clone());
+    }
+
+    if selected_notes_data.is_empty() {
+        return;
+    }
+
+    let min_start = selected_notes_data
+        .iter()
+        .map(|n| n.start.0)
+        .min()
+        .unwrap_or(0);
+    let max_end = selected_notes_data
+        .iter()
+        .map(|n| n.start.0 + n.length.0)
+        .max()
+        .unwrap_or(0);
+    let span = max_end.saturating_sub(min_start);
+
+    let mut new_notes = Vec::with_capacity(selected_notes_data.len());
+    let mut pending = Vec::with_capacity(selected_notes_data.len());
+
+    for note in &selected_notes_data {
+        let offset = note.start.0.saturating_sub(min_start);
+        let new_start = Ticks(max_end + offset);
+        new_notes.push(octava_core::NewNote {
+            key: note.key,
+            velocity: note.velocity,
+            start: new_start,
+            length: note.length,
+        });
+        pending.push((new_start, note.length, note.key));
+    }
+
+    state.note_clipboard = Some(crate::state::NoteClipboard {
+        pattern: pattern.id,
+        span,
+        last_end: max_end + span,
+        notes: selected_notes_data
+            .iter()
+            .map(|n| crate::state::ClipboardNote {
+                tick_offset: n.start.0.saturating_sub(min_start),
+                length: n.length,
+                key: n.key,
+                velocity: n.velocity,
+            })
+            .collect(),
+    });
+
+    state.pending_notes = Some(crate::state::PendingNotes {
+        pattern: pattern.id,
+        notes: pending,
+    });
+
+    actions.push(UiAction::Edit(EditCommand::AddNotes {
+        pattern: pattern.id,
+        notes: new_notes,
+    }));
+}
+
+fn paste_notes(
+    project: &Project,
+    pattern: &Pattern,
+    grid: &Grid,
+    state: &mut UiState,
+    actions: &mut Vec<UiAction>,
+    pointer_pos: Option<egui::Pos2>,
+) {
+    let Some(clip) = state.note_clipboard.clone() else {
+        return;
+    };
+    if clip.notes.is_empty() {
+        return;
+    }
+
+    let base_tick = if !state.selected_notes.is_empty() || state.selected_note.is_some() {
+        let mut max_end = 0;
+        for note_ref in &state.selected_notes {
+            if note_ref.pattern == pattern.id
+                && let Some(note) = pattern.note(note_ref.note)
+            {
+                max_end = max_end.max(note.start.0 + note.length.0);
+            }
+        }
+        if max_end == 0
+            && let Some(sel) = state.selected_note
+            && sel.pattern == pattern.id
+            && let Some(note) = pattern.note(sel.note)
+        {
+            max_end = note.start.0 + note.length.0;
+        }
+        if max_end > 0 { max_end } else { clip.last_end }
+    } else if let Some(pointer) = pointer_pos
+        && grid.rect.contains(pointer)
+    {
+        state
+            .snap
+            .snap_tick_floor(grid.x_to_tick(pointer.x), project.tempo_map.ppq())
+    } else {
+        clip.last_end
+    };
+
+    let mut new_notes = Vec::with_capacity(clip.notes.len());
+    let mut pending = Vec::with_capacity(clip.notes.len());
+
+    for note in &clip.notes {
+        let new_start = Ticks(base_tick.saturating_add(note.tick_offset));
+        new_notes.push(octava_core::NewNote {
+            key: note.key,
+            velocity: note.velocity,
+            start: new_start,
+            length: note.length,
+        });
+        pending.push((new_start, note.length, note.key));
+    }
+
+    if let Some(cb) = &mut state.note_clipboard {
+        cb.last_end = base_tick.saturating_add(clip.span);
+    }
+
+    state.pending_notes = Some(crate::state::PendingNotes {
+        pattern: pattern.id,
+        notes: pending,
+    });
+
+    actions.push(UiAction::Edit(EditCommand::AddNotes {
+        pattern: pattern.id,
+        notes: new_notes,
+    }));
 }
 
 fn key_at_y(grid: &Grid, y: f32) -> u8 {
@@ -1400,5 +1619,86 @@ mod tests {
 
         assert_eq!(pending.tick, step * 8);
         assert_eq!(pending.length, step);
+    }
+
+    #[test]
+    fn duplicate_selected_notes_places_immediately_after_max_end() {
+        let mut project = Project::new("test");
+        let ppq = project.tempo_map.ppq();
+        let pattern_id = project
+            .add_pattern("test", Ticks::from_quarters(4.0, ppq))
+            .expect("test pattern is valid");
+        let n1 = project
+            .add_note(pattern_id, 60, 100, Ticks(0), Ticks(480))
+            .expect("valid note 1");
+        let n2 = project
+            .add_note(pattern_id, 64, 100, Ticks(480), Ticks(480))
+            .expect("valid note 2");
+        let pattern = project.pattern(pattern_id).expect("pattern exists");
+
+        let mut state = UiState::default();
+        state.selected_notes.insert(NoteRef {
+            pattern: pattern_id,
+            note: n1,
+        });
+        state.selected_notes.insert(NoteRef {
+            pattern: pattern_id,
+            note: n2,
+        });
+
+        let mut actions = Vec::new();
+        duplicate_selected_notes(pattern, &mut state, &mut actions);
+
+        assert_eq!(actions.len(), 1);
+        if let UiAction::Edit(EditCommand::AddNotes { pattern: p, notes }) = &actions[0] {
+            assert_eq!(*p, pattern_id);
+            assert_eq!(notes.len(), 2);
+            assert_eq!(notes[0].start, Ticks(960));
+            assert_eq!(notes[0].key, 60);
+            assert_eq!(notes[1].start, Ticks(1440));
+            assert_eq!(notes[1].key, 64);
+        } else {
+            panic!("Expected EditCommand::AddNotes");
+        }
+    }
+
+    #[test]
+    fn copy_and_paste_notes_chains_after_end() {
+        let mut project = Project::new("test");
+        let ppq = project.tempo_map.ppq();
+        let pattern_id = project
+            .add_pattern("test", Ticks::from_quarters(4.0, ppq))
+            .expect("test pattern is valid");
+        let n1 = project
+            .add_note(pattern_id, 60, 100, Ticks(0), Ticks(480))
+            .expect("valid note 1");
+        let pattern = project.pattern(pattern_id).expect("pattern exists");
+
+        let mut state = UiState::default();
+        state.selected_notes.insert(NoteRef {
+            pattern: pattern_id,
+            note: n1,
+        });
+
+        copy_selected_notes(pattern, &mut state);
+        assert!(state.note_clipboard.is_some());
+        let cb = state.note_clipboard.as_ref().expect("clipboard populated");
+        assert_eq!(cb.notes.len(), 1);
+        assert_eq!(cb.span, 480);
+        assert_eq!(cb.last_end, 480);
+
+        let grid = test_grid();
+        let mut actions = Vec::new();
+        paste_notes(&project, pattern, &grid, &mut state, &mut actions, None);
+
+        assert_eq!(actions.len(), 1);
+        if let UiAction::Edit(EditCommand::AddNotes { pattern: p, notes }) = &actions[0] {
+            assert_eq!(*p, pattern_id);
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].start, Ticks(480));
+            assert_eq!(notes[0].key, 60);
+        } else {
+            panic!("Expected EditCommand::AddNotes");
+        }
     }
 }
