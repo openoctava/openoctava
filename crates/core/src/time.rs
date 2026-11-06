@@ -457,6 +457,11 @@ mod tests {
         assert_eq!(six_eight.ticks_per_beat(960), 480);
         assert_eq!(six_eight.ticks_per_bar(960), 2880);
 
+        let three_four = TimeSignature::new(3, 4).unwrap();
+        assert_eq!(three_four.ticks_per_beat(960), 960);
+        assert_eq!(three_four.ticks_per_bar(960), 2880);
+        assert_eq!(three_four.bar_beat_tick(Ticks(3840), 960), (1, 1, 0));
+
         assert!(TimeSignature::new(0, 4).is_err());
         assert!(TimeSignature::new(4, 3).is_err());
     }

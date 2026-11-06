@@ -347,6 +347,7 @@ pub(crate) fn apply(
             length,
         } => {
             let note = project.add_note(*pattern, *key, *velocity, *start, *length)?;
+            project.fit_pattern_to_notes(*pattern);
             outcome.note = Some(note);
             outcome.pattern = Some(*pattern);
         }
@@ -369,6 +370,7 @@ pub(crate) fn apply(
                     first_id = Some(id);
                 }
             }
+            project.fit_pattern_to_notes(*pattern);
             outcome.note = first_id;
             outcome.pattern = Some(*pattern);
         }
@@ -392,6 +394,7 @@ pub(crate) fn apply(
                 .notes
                 .retain(|note| !unique.contains(&note.id));
             outcome.removed_notes = before - project.patterns[index].notes.len();
+            project.fit_pattern_to_notes(*pattern);
             outcome.pattern = Some(*pattern);
         }
         EditCommand::MoveNotes {
@@ -441,6 +444,7 @@ pub(crate) fn apply(
                 note.start = Ticks((note.start.0 as i128 + i128::from(*delta_ticks)) as u64);
                 note.key = (i128::from(note.key) + i128::from(*delta_key)) as u8;
             }
+            project.fit_pattern_to_notes(*pattern);
             outcome.pattern = Some(*pattern);
         }
         EditCommand::ResizeNote {
@@ -465,6 +469,7 @@ pub(crate) fn apply(
             let stored = &mut project.patterns[index];
             stored.notes[note_index].start = *start;
             stored.notes[note_index].length = *length;
+            project.fit_pattern_to_notes(*pattern);
             outcome.note = Some(*note);
             outcome.pattern = Some(*pattern);
         }
@@ -509,6 +514,7 @@ pub(crate) fn apply(
                 let note = &mut stored.notes[note_index];
                 note.length = Ticks((note.length.0 as i128 + i128::from(*delta_ticks)) as u64);
             }
+            project.fit_pattern_to_notes(*pattern);
             outcome.pattern = Some(*pattern);
         }
         EditCommand::SetNoteVelocity {
@@ -536,6 +542,14 @@ pub(crate) fn apply(
                 return Err(ModelError::InvalidTimeSignature);
             }
             project.time_signature = *time_signature;
+            let patterns = project
+                .patterns
+                .iter()
+                .map(|pattern| pattern.id)
+                .collect::<Vec<_>>();
+            for pattern in patterns {
+                project.fit_pattern_to_notes(pattern);
+            }
         }
         EditCommand::AddSample {
             track,
@@ -817,6 +831,220 @@ mod tests {
         let p = store.project().pattern(pattern).unwrap();
         assert_eq!(p.note(note1).unwrap().length, Ticks(240));
         assert_eq!(p.note(note2).unwrap().length, Ticks(480));
+    }
+
+    #[test]
+    fn removing_notes_shrinks_pattern_and_full_clip_to_last_bar() {
+        let (mut store, track, pattern, clip) = fixture();
+
+        store
+            .apply(EditCommand::AddNote {
+                pattern,
+                key: 60,
+                velocity: 100,
+                start: Ticks::ZERO,
+                length: Ticks(480),
+            })
+            .unwrap();
+        let later = store
+            .apply(EditCommand::AddNote {
+                pattern,
+                key: 64,
+                velocity: 100,
+                start: Ticks(7680),
+                length: Ticks(480),
+            })
+            .unwrap()
+            .note
+            .unwrap();
+
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().length,
+            Ticks(11520)
+        );
+        assert_eq!(
+            store
+                .project()
+                .track(track)
+                .unwrap()
+                .clip(clip)
+                .unwrap()
+                .length,
+            Ticks(11520)
+        );
+
+        store
+            .apply(EditCommand::RemoveNotes {
+                pattern,
+                notes: vec![later],
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().length,
+            Ticks(3840)
+        );
+        assert_eq!(
+            store
+                .project()
+                .track(track)
+                .unwrap()
+                .clip(clip)
+                .unwrap()
+                .length,
+            Ticks(3840)
+        );
+    }
+
+    #[test]
+    fn moving_and_resizing_notes_refit_pattern_length() {
+        let (mut store, _track, pattern, _clip) = fixture();
+
+        let note = store
+            .apply(EditCommand::AddNote {
+                pattern,
+                key: 60,
+                velocity: 100,
+                start: Ticks::ZERO,
+                length: Ticks(480),
+            })
+            .unwrap()
+            .note
+            .unwrap();
+
+        store
+            .apply(EditCommand::MoveNotes {
+                pattern,
+                notes: vec![note],
+                delta_ticks: 7680,
+                delta_key: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().length,
+            Ticks(11520)
+        );
+
+        store
+            .apply(EditCommand::MoveNotes {
+                pattern,
+                notes: vec![note],
+                delta_ticks: -7680,
+                delta_key: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().length,
+            Ticks(3840)
+        );
+
+        store
+            .apply(EditCommand::ResizeNote {
+                pattern,
+                note,
+                start: Ticks::ZERO,
+                length: Ticks(4000),
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().length,
+            Ticks(7680)
+        );
+
+        store
+            .apply(EditCommand::ResizeNote {
+                pattern,
+                note,
+                start: Ticks::ZERO,
+                length: Ticks(480),
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().length,
+            Ticks(3840)
+        );
+    }
+
+    #[test]
+    fn time_signature_change_refits_patterns_to_the_new_bar() {
+        let (mut store, track, pattern, clip) = fixture();
+
+        store
+            .apply(EditCommand::AddNote {
+                pattern,
+                key: 60,
+                velocity: 100,
+                start: Ticks::ZERO,
+                length: Ticks(480),
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().length,
+            Ticks(3840)
+        );
+
+        store
+            .apply(EditCommand::SetTimeSignature {
+                time_signature: TimeSignature::new(3, 4).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().length,
+            Ticks(2880)
+        );
+        assert_eq!(
+            store
+                .project()
+                .track(track)
+                .unwrap()
+                .clip(clip)
+                .unwrap()
+                .length,
+            Ticks(2880)
+        );
+
+        store
+            .apply(EditCommand::SetTimeSignature {
+                time_signature: TimeSignature::new(4, 4).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().length,
+            Ticks(3840)
+        );
+    }
+
+    #[test]
+    fn trimmed_clip_keeps_its_length_when_pattern_grows() {
+        let (mut store, track, pattern, clip) = fixture();
+
+        store
+            .apply(EditCommand::ResizeClip {
+                track,
+                clip,
+                length: Ticks(1920),
+            })
+            .unwrap();
+        store
+            .apply(EditCommand::AddNote {
+                pattern,
+                key: 60,
+                velocity: 100,
+                start: Ticks(7680),
+                length: Ticks(480),
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .project()
+                .track(track)
+                .unwrap()
+                .clip(clip)
+                .unwrap()
+                .length,
+            Ticks(1920)
+        );
     }
 
     #[test]

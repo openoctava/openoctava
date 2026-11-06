@@ -26,7 +26,7 @@ pub(crate) fn show(
     state: &mut UiState,
     actions: &mut Vec<UiAction>,
 ) {
-    toolbar(ui, state, actions);
+    toolbar(ui, project, state, actions);
     ui.add_space(2.0);
 
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
@@ -115,7 +115,7 @@ pub(crate) fn show(
     }
 }
 
-fn toolbar(ui: &mut egui::Ui, state: &mut UiState, actions: &mut Vec<UiAction>) {
+fn toolbar(ui: &mut egui::Ui, project: &Project, state: &mut UiState, actions: &mut Vec<UiAction>) {
     egui::Frame::NONE
         .fill(theme::PANEL)
         .inner_margin(egui::Margin::symmetric(8, 3))
@@ -153,6 +153,15 @@ fn toolbar(ui: &mut egui::Ui, state: &mut UiState, actions: &mut Vec<UiAction>) 
                             );
                         }
                     });
+
+                ui.separator();
+                ui.label(
+                    RichText::new("METER")
+                        .size(9.0)
+                        .strong()
+                        .color(theme::TEXT_FAINT),
+                );
+                crate::time_signature_combo(ui, "piano-roll-meter", project, actions);
 
                 ui.separator();
                 let has_selected_notes =

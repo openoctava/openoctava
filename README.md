@@ -12,6 +12,8 @@ The project is under active development. The current foundation includes:
 - Offline WAV rendering that reuses the same scheduler and synthesizer as live playback.
 - A flat clip library: write a pattern once, drag it into the timeline, and every placement plays the same notes.
 - Piano-roll note creation, movement, resizing, and deletion; timeline clip movement, right-edge resizing, and track reordering with configurable snapping.
+- Pattern clips automatically resize to the last bar that contains notes after every note edit; explicitly trimmed timeline placements keep their shorter length.
+- A project time-signature picker (including 3/4) with bar and beat grids that follow the selected meter.
 - Per-track mixer strips with mute, solo, gain, and pan controls.
 - Clip and track context menus, clip copy/paste/duplicate, drag-and-drop from the clip library, plus note audition from the piano roll and its key gutter.
 - WAV export from the Export menu, reusing the live audio scheduler.

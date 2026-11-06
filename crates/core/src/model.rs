@@ -452,6 +452,49 @@ impl Project {
         Ok(id)
     }
 
+    /// Fits a pattern's length to the last bar that contains note material.
+    ///
+    /// The pattern and every full-length placement of it follow the notes, so
+    /// adding notes in later bars grows the clip and deleting or moving them
+    /// earlier shrinks it again. Placements that were trimmed shorter keep
+    /// their own length, but are capped when the pattern becomes shorter.
+    /// An empty pattern keeps a minimum length of one bar.
+    pub fn fit_pattern_to_notes(&mut self, pattern_id: PatternId) {
+        let Some(pattern) = self.pattern(pattern_id) else {
+            return;
+        };
+        let old_len = pattern.length;
+        let bar_ticks = self
+            .time_signature
+            .ticks_per_bar(self.tempo_map.ppq())
+            .max(1);
+        let notes_end = pattern
+            .notes
+            .iter()
+            .map(Note::end)
+            .max()
+            .unwrap_or(Ticks::ZERO);
+        let needed_bars = notes_end.0.div_ceil(bar_ticks).max(1);
+        let new_len = Ticks(needed_bars.saturating_mul(bar_ticks));
+
+        if new_len != old_len
+            && let Some(pattern) = self.pattern_mut(pattern_id)
+        {
+            pattern.length = new_len;
+        }
+
+        for track in &mut self.tracks {
+            for clip in &mut track.clips {
+                if clip.pattern != pattern_id {
+                    continue;
+                }
+                if clip.length == old_len || clip.length > new_len {
+                    clip.length = new_len;
+                }
+            }
+        }
+    }
+
     /// Ensures that a pattern is at least `end` ticks long, expanding it to the next
     /// bar boundary if necessary. Any clip placement whose length previously matched
     /// the pattern is also expanded to keep the full pattern audible on the timeline.
@@ -471,7 +514,7 @@ impl Project {
 
             for track in &mut self.tracks {
                 for clip in &mut track.clips {
-                    if clip.pattern == pattern_id && clip.length <= old_len {
+                    if clip.pattern == pattern_id && clip.length == old_len {
                         clip.length = new_len;
                     }
                 }

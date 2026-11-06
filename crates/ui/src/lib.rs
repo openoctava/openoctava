@@ -18,7 +18,7 @@ use egui::{
     WidgetText, vec2,
 };
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
-use octava_core::{EditCommand, Project, Ticks};
+use octava_core::{EditCommand, Project, Ticks, TimeSignature};
 
 pub use state::{
     AudioSettingsView, DocumentView, FilesView, PlaybackView, SampleEntry, SoundfontPreset,
@@ -706,6 +706,76 @@ impl TabViewer for WorkspaceViewer<'_> {
     }
 }
 
+/// Time signatures offered by the transport and piano-roll meter pickers.
+pub(crate) const COMMON_TIME_SIGNATURES: [TimeSignature; 8] = [
+    TimeSignature {
+        numerator: 2,
+        denominator: 4,
+    },
+    TimeSignature {
+        numerator: 3,
+        denominator: 4,
+    },
+    TimeSignature {
+        numerator: 4,
+        denominator: 4,
+    },
+    TimeSignature {
+        numerator: 5,
+        denominator: 4,
+    },
+    TimeSignature {
+        numerator: 6,
+        denominator: 8,
+    },
+    TimeSignature {
+        numerator: 7,
+        denominator: 8,
+    },
+    TimeSignature {
+        numerator: 9,
+        denominator: 8,
+    },
+    TimeSignature {
+        numerator: 12,
+        denominator: 8,
+    },
+];
+
+fn signature_label(signature: TimeSignature) -> String {
+    format!("{}/{}", signature.numerator, signature.denominator)
+}
+
+/// Draws a meter picker and emits [`EditCommand::SetTimeSignature`] when the
+/// user chooses a different signature.
+pub(crate) fn time_signature_combo(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    project: &Project,
+    actions: &mut Vec<UiAction>,
+) {
+    let current = project.time_signature;
+    let mut selected = current;
+
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(signature_label(current))
+        .width(52.0)
+        .show_ui(ui, |ui| {
+            for candidate in COMMON_TIME_SIGNATURES {
+                ui.selectable_value(&mut selected, candidate, signature_label(candidate));
+            }
+            if !COMMON_TIME_SIGNATURES.contains(&current) {
+                ui.selectable_value(&mut selected, current, signature_label(current));
+            }
+        });
+
+    if selected != current {
+        actions.push(UiAction::Edit(EditCommand::SetTimeSignature {
+            time_signature: selected,
+        }));
+    }
+}
+
 fn transport_bar(
     ui: &mut egui::Ui,
     project: &Project,
@@ -805,14 +875,7 @@ fn transport_bar(
                         bpm: drag.bpm,
                     }));
                 }
-                ui.label(
-                    RichText::new(format!(
-                        "{}/{}",
-                        project.time_signature.numerator, project.time_signature.denominator
-                    ))
-                    .size(11.5)
-                    .color(theme::TEXT_DIM),
-                );
+                time_signature_combo(ui, "transport-meter", project, actions);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     peak_meter(ui, "R", playback.peak_right);
