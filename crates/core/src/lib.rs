@@ -15,8 +15,8 @@ pub mod time;
 
 pub use command::{EditCommand, EditOutcome, NewNote};
 pub use model::{
-    Clip, ClipId, EffectId, EffectKind, EffectSlot, ModelError, Note, NoteId, Pattern, PatternId,
-    Preset, Project, SampleClip, SampleId, Track, TrackId,
+    Clip, ClipId, EffectId, EffectKind, EffectSlot, MasterTrack, ModelError, Note, NoteId, Pattern,
+    PatternId, Preset, Project, SampleClip, SampleId, Track, TrackId,
 };
 pub use persist::{
     PROJECT_EXTENSION, PROJECT_FORMAT, PROJECT_VERSION, PersistError, decode_project,

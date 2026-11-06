@@ -381,7 +381,8 @@ pub(crate) enum MixerParam {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MixerDrag {
-    pub track: TrackId,
+    /// Track being adjusted, or `None` for the master bus strip.
+    pub track: Option<TrackId>,
     pub param: MixerParam,
     pub original: f32,
     pub preview: f32,

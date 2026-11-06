@@ -48,29 +48,44 @@ pub(crate) fn show(
             });
             ui.add_space(4.0);
 
-            if project.tracks.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("Add a track to open the mixer")
-                            .size(13.0)
-                            .color(theme::TEXT_DIM),
-                    );
-                });
-                return;
-            }
-
             let height = ui.available_height().max(180.0);
-            egui::ScrollArea::horizontal()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_min_height(height);
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        for (index, track) in project.tracks.iter().enumerate() {
-                            strip(ui, project, track, index, height, state, actions);
-                        }
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+
+                master_strip(ui, project, playback, height, state, actions);
+
+                let sep_height = (height - 12.0).max(140.0);
+                let (rect, _) = ui.allocate_exact_size(vec2(1.0, sep_height), Sense::hover());
+                ui.painter().line_segment(
+                    [
+                        pos2(rect.center().x, rect.top()),
+                        pos2(rect.center().x, rect.bottom()),
+                    ],
+                    Stroke::new(1.0, theme::GRID_LINE),
+                );
+
+                if project.tracks.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("Click \"+ Track\" to add a track")
+                                .size(13.0)
+                                .color(theme::TEXT_DIM),
+                        );
                     });
-                });
+                } else {
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_height(height);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for (index, track) in project.tracks.iter().enumerate() {
+                                    strip(ui, project, track, index, height, state, actions);
+                                }
+                            });
+                        });
+                }
+            });
         });
 
     if add_track {
@@ -189,22 +204,22 @@ fn strip(
                 });
 
                 ui.add_space(5.0);
-                effects_section(ui, track, actions);
+                effects_section(ui, Some(track.id), &track.effects, actions);
 
                 ui.add_space(4.0);
                 let fader_height = (ui.available_height() - STRIP_FOOTER).max(MIN_FADER_HEIGHT);
                 ui.horizontal_top(|ui| {
-                    let gain = current_value(track.id, MixerParam::Gain, track.gain, state);
+                    let gain = current_value(Some(track.id), MixerParam::Gain, track.gain, state);
                     let (response, new_gain) = fader(ui, gain, color, fader_height);
                     if response.drag_started() {
-                        begin_drag(state, track.id, MixerParam::Gain, gain);
+                        begin_drag(state, Some(track.id), MixerParam::Gain, gain);
                     } else if response.dragged() {
                         update_drag(state, MixerParam::Gain, new_gain);
                     }
                     response.on_hover_text("Gain");
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
-                        let pan = current_value(track.id, MixerParam::Pan, track.pan, state);
+                        let pan = current_value(Some(track.id), MixerParam::Pan, track.pan, state);
                         ui.label(
                             RichText::new(gain_label(gain))
                                 .monospace()
@@ -214,7 +229,7 @@ fn strip(
                         ui.add_space(2.0);
                         let (response, new_pan) = pan_slider(ui, pan, color);
                         if response.drag_started() {
-                            begin_drag(state, track.id, MixerParam::Pan, pan);
+                            begin_drag(state, Some(track.id), MixerParam::Pan, pan);
                         } else if response.dragged() {
                             update_drag(state, MixerParam::Pan, new_pan);
                         }
@@ -238,7 +253,173 @@ fn strip(
         });
 }
 
-fn effects_section(ui: &mut egui::Ui, track: &Track, actions: &mut Vec<UiAction>) {
+fn master_strip(
+    ui: &mut egui::Ui,
+    project: &Project,
+    playback: &PlaybackView,
+    height: f32,
+    state: &mut UiState,
+    actions: &mut Vec<UiAction>,
+) {
+    let master_color = theme::ACCENT;
+    let content_height = (height - 12.0).max(140.0);
+
+    egui::Frame::NONE
+        .fill(theme::PANEL)
+        .stroke(Stroke::new(1.0, theme::GRID_LINE))
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(STRIP_WIDTH);
+            ui.set_height(content_height);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(7.0, 7.0), Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 3.5, master_color);
+                    ui.label(
+                        RichText::new("Master")
+                            .size(11.5)
+                            .strong()
+                            .color(master_color),
+                    );
+                });
+                ui.label(
+                    RichText::new("Main Output")
+                        .size(9.0)
+                        .color(theme::TEXT_FAINT),
+                );
+                ui.add_space(3.0);
+
+                let mut mute = project.master.mute;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(
+                            [30.0, 20.0],
+                            egui::Button::new(RichText::new("M").size(10.0)).fill(if mute {
+                                Color32::from_rgb(120, 52, 48)
+                            } else {
+                                theme::PANEL_RAISED
+                            }),
+                        )
+                        .on_hover_text("Mute Master")
+                        .clicked()
+                    {
+                        mute = !mute;
+                        actions.push(UiAction::Edit(EditCommand::SetMasterParams {
+                            gain: None,
+                            pan: None,
+                            mute: Some(mute),
+                        }));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{} tracks", project.tracks.len()))
+                                .size(8.5)
+                                .color(theme::TEXT_FAINT),
+                        );
+                    });
+                });
+
+                ui.add_space(5.0);
+                effects_section(ui, None, &project.master.effects, actions);
+
+                ui.add_space(4.0);
+                let fader_height = (ui.available_height() - STRIP_FOOTER).max(MIN_FADER_HEIGHT);
+                ui.horizontal_top(|ui| {
+                    let gain = current_value(None, MixerParam::Gain, project.master.gain, state);
+                    let (response, new_gain) = fader(ui, gain, master_color, fader_height);
+                    if response.drag_started() {
+                        begin_drag(state, None, MixerParam::Gain, gain);
+                    } else if response.dragged() {
+                        update_drag(state, MixerParam::Gain, new_gain);
+                    }
+                    response.on_hover_text("Master Gain");
+
+                    ui.add_space(2.0);
+                    vertical_stereo_meter(
+                        ui,
+                        playback.peak_left,
+                        playback.peak_right,
+                        fader_height,
+                    );
+
+                    ui.add_space(2.0);
+                    ui.vertical(|ui| {
+                        let pan = current_value(None, MixerParam::Pan, project.master.pan, state);
+                        ui.label(
+                            RichText::new(gain_label(gain))
+                                .monospace()
+                                .size(10.0)
+                                .color(theme::TEXT),
+                        );
+                        ui.add_space(2.0);
+                        let (response, new_pan) = pan_slider(ui, pan, master_color);
+                        if response.drag_started() {
+                            begin_drag(state, None, MixerParam::Pan, pan);
+                        } else if response.dragged() {
+                            update_drag(state, MixerParam::Pan, new_pan);
+                        }
+                        response.on_hover_text("Master Pan");
+                        ui.label(
+                            RichText::new(pan_label(pan))
+                                .monospace()
+                                .size(9.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+                });
+
+                ui.add_space((ui.available_height() - STRIP_FOOTER).max(0.0));
+                ui.label(
+                    RichText::new("Stereo Out")
+                        .size(8.5)
+                        .color(theme::TEXT_FAINT),
+                );
+            });
+        });
+}
+
+fn vertical_stereo_meter(ui: &mut egui::Ui, peak_l: f32, peak_r: f32, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(10.0, height), Sense::hover());
+    let painter = ui.painter();
+    let bar_width = 4.0;
+    let bar_height = rect.height() - 8.0;
+    let top_y = rect.top() + 4.0;
+
+    let left_rect = Rect::from_min_size(pos2(rect.left(), top_y), vec2(bar_width, bar_height));
+    let right_rect =
+        Rect::from_min_size(pos2(rect.left() + 5.0, top_y), vec2(bar_width, bar_height));
+
+    painter.rect_filled(left_rect, CornerRadius::same(1), theme::BACKGROUND);
+    painter.rect_filled(right_rect, CornerRadius::same(1), theme::BACKGROUND);
+
+    draw_vertical_meter_bar(painter, left_rect, peak_l);
+    draw_vertical_meter_bar(painter, right_rect, peak_r);
+}
+
+fn draw_vertical_meter_bar(painter: &egui::Painter, rect: Rect, value: f32) {
+    let value = value.clamp(0.0, 1.0);
+    if value <= 0.001 {
+        return;
+    }
+    let fill_h = rect.height() * value;
+    let fill_rect = Rect::from_min_max(pos2(rect.left(), rect.bottom() - fill_h), rect.max);
+    let color = if value > 0.95 {
+        Color32::from_rgb(222, 112, 102)
+    } else if value > 0.8 {
+        Color32::from_rgb(228, 172, 76)
+    } else {
+        Color32::from_rgb(112, 186, 124)
+    };
+    painter.rect_filled(fill_rect, CornerRadius::same(1), color);
+}
+
+fn effects_section(
+    ui: &mut egui::Ui,
+    track_id: Option<TrackId>,
+    effects: &[octava_core::EffectSlot],
+    actions: &mut Vec<UiAction>,
+) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("FX")
@@ -258,7 +439,7 @@ fn effects_section(ui: &mut egui::Ui, track: &Track, actions: &mut Vec<UiAction>
                 for kind in EffectKind::ALL {
                     if ui.button(kind.label()).clicked() {
                         actions.push(UiAction::Edit(EditCommand::AddEffect {
-                            track: track.id,
+                            track: track_id,
                             kind,
                         }));
                         ui.close();
@@ -270,7 +451,7 @@ fn effects_section(ui: &mut egui::Ui, track: &Track, actions: &mut Vec<UiAction>
         });
     });
 
-    if track.effects.is_empty() {
+    if effects.is_empty() {
         ui.label(
             RichText::new("No effects")
                 .size(8.5)
@@ -279,12 +460,13 @@ fn effects_section(ui: &mut egui::Ui, track: &Track, actions: &mut Vec<UiAction>
         return;
     }
 
+    let salt = track_id.map_or(0, |id| id.0);
     egui::ScrollArea::vertical()
-        .id_salt(("mixer-effects", track.id.0))
+        .id_salt(("mixer-effects", salt))
         .max_height(64.0)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            for effect in &track.effects {
+            for effect in effects {
                 ui.horizontal(|ui| {
                     let dot = if effect.bypassed { "○" } else { "●" };
                     if ui
@@ -306,7 +488,7 @@ fn effects_section(ui: &mut egui::Ui, track: &Track, actions: &mut Vec<UiAction>
                         .clicked()
                     {
                         actions.push(UiAction::Edit(EditCommand::SetEffectBypassed {
-                            track: track.id,
+                            track: track_id,
                             effect: effect.id,
                             bypassed: !effect.bypassed,
                         }));
@@ -331,7 +513,7 @@ fn effects_section(ui: &mut egui::Ui, track: &Track, actions: &mut Vec<UiAction>
                             .clicked()
                         {
                             actions.push(UiAction::Edit(EditCommand::RemoveEffect {
-                                track: track.id,
+                                track: track_id,
                                 effect: effect.id,
                             }));
                         }
@@ -341,14 +523,14 @@ fn effects_section(ui: &mut egui::Ui, track: &Track, actions: &mut Vec<UiAction>
         });
 }
 
-fn current_value(track: TrackId, param: MixerParam, stored: f32, state: &UiState) -> f32 {
+fn current_value(track: Option<TrackId>, param: MixerParam, stored: f32, state: &UiState) -> f32 {
     state
         .mixer_drag
         .filter(|drag| drag.track == track && drag.param == param)
         .map_or(stored, |drag| drag.preview)
 }
 
-fn begin_drag(state: &mut UiState, track: TrackId, param: MixerParam, value: f32) {
+fn begin_drag(state: &mut UiState, track: Option<TrackId>, param: MixerParam, value: f32) {
     state.mixer_drag = Some(MixerDrag {
         track,
         param,
@@ -374,25 +556,44 @@ fn finish_mixer_drag(project: &Project, state: &mut UiState, actions: &mut Vec<U
     let Some(drag) = state.mixer_drag.take() else {
         return;
     };
-    if project.track(drag.track).is_none() || (drag.preview - drag.original).abs() < 0.001 {
+    if (drag.preview - drag.original).abs() < 0.001 {
         return;
     }
 
-    match drag.param {
-        MixerParam::Gain => actions.push(track_params(
-            drag.track,
-            Some(drag.preview.clamp(0.0, 1.0)),
-            None,
-            None,
-            None,
-        )),
-        MixerParam::Pan => actions.push(track_params(
-            drag.track,
-            None,
-            Some(drag.preview.clamp(-1.0, 1.0)),
-            None,
-            None,
-        )),
+    match drag.track {
+        Some(track_id) => {
+            if project.track(track_id).is_none() {
+                return;
+            }
+            match drag.param {
+                MixerParam::Gain => actions.push(track_params(
+                    track_id,
+                    Some(drag.preview.clamp(0.0, 1.0)),
+                    None,
+                    None,
+                    None,
+                )),
+                MixerParam::Pan => actions.push(track_params(
+                    track_id,
+                    None,
+                    Some(drag.preview.clamp(-1.0, 1.0)),
+                    None,
+                    None,
+                )),
+            }
+        }
+        None => match drag.param {
+            MixerParam::Gain => actions.push(UiAction::Edit(EditCommand::SetMasterParams {
+                gain: Some(drag.preview.clamp(0.0, 1.0)),
+                pan: None,
+                mute: None,
+            })),
+            MixerParam::Pan => actions.push(UiAction::Edit(EditCommand::SetMasterParams {
+                gain: None,
+                pan: Some(drag.preview.clamp(-1.0, 1.0)),
+                mute: None,
+            })),
+        },
     }
 }
 

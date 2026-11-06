@@ -258,6 +258,16 @@ impl Runtime {
             right[rendered..].fill(0.0);
         }
 
+        if let Some(snapshot) = &self.snapshot {
+            apply_master(
+                &mut left[..rendered],
+                &mut right[..rendered],
+                snapshot.master_gain,
+                snapshot.master_pan,
+                snapshot.master_mute,
+            );
+        }
+
         if self.state == TransportState::Playing {
             self.peak_left = peak(&left[..rendered]);
             self.peak_right = peak(&right[..rendered]);
@@ -272,6 +282,15 @@ impl Runtime {
     pub(crate) fn render_tail(&mut self, left: &mut [f32], right: &mut [f32]) {
         let _ = self.synth.write((&mut *left, &mut *right));
         self.mix_sample_voices(left, right);
+        if let Some(snapshot) = &self.snapshot {
+            apply_master(
+                left,
+                right,
+                snapshot.master_gain,
+                snapshot.master_pan,
+                snapshot.master_mute,
+            );
+        }
         self.peak_left = peak(left);
         self.peak_right = peak(right);
         self.publish();
@@ -674,6 +693,22 @@ impl Runtime {
     }
 }
 
+fn apply_master(left: &mut [f32], right: &mut [f32], gain: f32, pan: f32, mute: bool) {
+    if mute {
+        left.fill(0.0);
+        right.fill(0.0);
+        return;
+    }
+    let gain = gain.clamp(0.0, 1.0);
+    let pan = pan.clamp(-1.0, 1.0);
+    let gain_left = gain * if pan > 0.0 { 1.0 - pan } else { 1.0 };
+    let gain_right = gain * if pan < 0.0 { 1.0 + pan } else { 1.0 };
+    for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+        *l *= gain_left;
+        *r *= gain_right;
+    }
+}
+
 fn peak(samples: &[f32]) -> f32 {
     samples
         .iter()
@@ -890,6 +925,9 @@ mod tests {
                 pan,
                 data,
             }],
+            master_gain: 1.0,
+            master_pan: 0.0,
+            master_mute: false,
         })
     }
 
@@ -979,5 +1017,48 @@ mod tests {
         render(&mut harness.runtime, 2);
         assert_eq!(harness.telemetry.state(), TransportState::Playing);
         assert!(harness.telemetry.playhead() > before);
+    }
+
+    #[test]
+    fn master_mute_and_gain_scale_playback_output() {
+        let mut harness = harness();
+        let mut project = Project::new("Master test");
+        let track = project.add_track("Piano").unwrap();
+        let pattern = project.add_pattern("Clip", Ticks(1920)).unwrap();
+        project.add_clip(track, pattern, Ticks::ZERO).unwrap();
+        project
+            .add_note(pattern, 60, 110, Ticks::ZERO, Ticks(480))
+            .unwrap();
+
+        // 1. Normal playback with unity master
+        let snap_normal = Arc::new(project.compile_snapshot());
+        harness
+            .commands
+            .push(AudioCommand::Play {
+                snapshot: snap_normal,
+                start: Ticks::ZERO,
+            })
+            .unwrap();
+        let mut left_norm = vec![0.0_f32; 512];
+        let mut right_norm = vec![0.0_f32; 512];
+        harness.runtime.render(&mut left_norm, &mut right_norm);
+        let peak_norm = peak(&left_norm);
+        assert!(peak_norm > 0.0);
+
+        // 2. Playback with muted master
+        project.master.mute = true;
+        let snap_muted = Arc::new(project.compile_snapshot());
+        harness
+            .commands
+            .push(AudioCommand::Play {
+                snapshot: snap_muted,
+                start: Ticks::ZERO,
+            })
+            .unwrap();
+        let mut left_muted = vec![0.0_f32; 512];
+        let mut right_muted = vec![0.0_f32; 512];
+        harness.runtime.render(&mut left_muted, &mut right_muted);
+        assert_eq!(peak(&left_muted), 0.0);
+        assert_eq!(peak(&right_muted), 0.0);
     }
 }

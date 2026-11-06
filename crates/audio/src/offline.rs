@@ -178,6 +178,9 @@ mod tests {
                 pan: 0.0,
                 data,
             }],
+            master_gain: 1.0,
+            master_pan: 0.0,
+            master_mute: false,
         };
         let mut renderer = OfflineRenderer::new(44_100).unwrap();
         let output = renderer.render(Arc::new(snapshot), 0.0).unwrap();

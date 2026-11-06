@@ -17,6 +17,9 @@ pub struct PlaybackSnapshot {
     pub events: Vec<TimedEvent>,
     /// Decoded audio samples sorted by start tick.
     pub samples: Vec<TimedSample>,
+    pub master_gain: f32,
+    pub master_pan: f32,
+    pub master_mute: bool,
 }
 
 /// A decoded audio clip scheduled on the arrangement.
@@ -149,6 +152,9 @@ impl Project {
             tracks,
             events,
             samples,
+            master_gain: self.master.gain,
+            master_pan: self.master.pan,
+            master_mute: self.master.mute,
         }
     }
 }

@@ -281,6 +281,46 @@ impl Track {
     }
 }
 
+/// Master output bus channel strip.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MasterTrack {
+    #[serde(default = "default_gain")]
+    pub gain: f32,
+    #[serde(default)]
+    pub pan: f32,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub effects: Vec<EffectSlot>,
+}
+
+fn default_gain() -> f32 {
+    1.0
+}
+
+impl Default for MasterTrack {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            pan: 0.0,
+            mute: false,
+            effects: Vec::new(),
+        }
+    }
+}
+
+impl MasterTrack {
+    #[must_use]
+    pub fn effect(&self, id: EffectId) -> Option<&EffectSlot> {
+        self.effects.iter().find(|effect| effect.id == id)
+    }
+
+    #[must_use]
+    pub fn effect_mut(&mut self, id: EffectId) -> Option<&mut EffectSlot> {
+        self.effects.iter_mut().find(|effect| effect.id == id)
+    }
+}
+
 /// Authoritative project document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
@@ -292,6 +332,9 @@ pub struct Project {
     #[serde(default)]
     pub soundfont: Option<PathBuf>,
     pub tracks: Vec<Track>,
+    /// Master bus strip controlling overall volume, pan, and master effects.
+    #[serde(default)]
+    pub master: MasterTrack,
     /// Reusable patterns. Clips on the timeline reference these by id.
     #[serde(default)]
     pub patterns: Vec<Pattern>,
@@ -324,6 +367,7 @@ impl Project {
             time_signature: TimeSignature::default(),
             soundfont: None,
             tracks: Vec::new(),
+            master: MasterTrack::default(),
             patterns: Vec::new(),
             next_track_id: 1,
             next_clip_id: 1,
@@ -600,6 +644,18 @@ impl Project {
             gain,
         });
         Ok(id)
+    }
+
+    /// Adds an insert effect placeholder to the master strip.
+    pub fn add_master_effect(&mut self, kind: EffectKind) -> EffectId {
+        let id = EffectId(self.next_effect_id);
+        self.next_effect_id += 1;
+        self.master.effects.push(EffectSlot {
+            id,
+            kind,
+            bypassed: false,
+        });
+        id
     }
 
     /// Adds an insert effect placeholder to a track.

@@ -150,17 +150,23 @@ pub enum EditCommand {
         sample: SampleId,
         start: Ticks,
     },
-    /// Adds an insert-effect placeholder to a mixer strip.
+    /// Sets parameters on the master output strip.
+    SetMasterParams {
+        gain: Option<f32>,
+        pan: Option<f32>,
+        mute: Option<bool>,
+    },
+    /// Adds an insert-effect placeholder to a track or the master strip (`None`).
     AddEffect {
-        track: TrackId,
+        track: Option<TrackId>,
         kind: EffectKind,
     },
     RemoveEffect {
-        track: TrackId,
+        track: Option<TrackId>,
         effect: EffectId,
     },
     SetEffectBypassed {
-        track: TrackId,
+        track: Option<TrackId>,
         effect: EffectId,
         bypassed: bool,
     },
@@ -590,22 +596,62 @@ pub(crate) fn apply(
             outcome.track = Some(*track);
             outcome.sample = Some(*sample);
         }
+        EditCommand::SetMasterParams { gain, pan, mute } => {
+            if let Some(gain) = gain
+                && (!gain.is_finite() || !(0.0..=1.0).contains(gain))
+            {
+                return Err(ModelError::InvalidGain);
+            }
+            if let Some(pan) = pan
+                && (!pan.is_finite() || !(-1.0..=1.0).contains(pan))
+            {
+                return Err(ModelError::InvalidPan);
+            }
+            if let Some(gain) = gain {
+                project.master.gain = *gain;
+            }
+            if let Some(pan) = pan {
+                project.master.pan = *pan;
+            }
+            if let Some(mute) = mute {
+                project.master.mute = *mute;
+            }
+        }
         EditCommand::AddEffect { track, kind } => {
-            let effect = project.add_effect(*track, *kind)?;
-            outcome.track = Some(*track);
+            let effect = match track {
+                Some(track_id) => {
+                    let effect = project.add_effect(*track_id, *kind)?;
+                    outcome.track = Some(*track_id);
+                    effect
+                }
+                None => project.add_master_effect(*kind),
+            };
             outcome.effect = Some(effect);
         }
         EditCommand::RemoveEffect { track, effect } => {
-            let stored = project
-                .track_mut(*track)
-                .ok_or(ModelError::TrackNotFound(*track))?;
-            let index = stored
-                .effects
-                .iter()
-                .position(|slot| slot.id == *effect)
-                .ok_or(ModelError::EffectNotFound(*effect))?;
-            stored.effects.remove(index);
-            outcome.track = Some(*track);
+            match track {
+                Some(track_id) => {
+                    let stored = project
+                        .track_mut(*track_id)
+                        .ok_or(ModelError::TrackNotFound(*track_id))?;
+                    let index = stored
+                        .effects
+                        .iter()
+                        .position(|slot| slot.id == *effect)
+                        .ok_or(ModelError::EffectNotFound(*effect))?;
+                    stored.effects.remove(index);
+                    outcome.track = Some(*track_id);
+                }
+                None => {
+                    let index = project
+                        .master
+                        .effects
+                        .iter()
+                        .position(|slot| slot.id == *effect)
+                        .ok_or(ModelError::EffectNotFound(*effect))?;
+                    project.master.effects.remove(index);
+                }
+            }
             outcome.effect = Some(*effect);
         }
         EditCommand::SetEffectBypassed {
@@ -613,14 +659,25 @@ pub(crate) fn apply(
             effect,
             bypassed,
         } => {
-            let stored = project
-                .track_mut(*track)
-                .ok_or(ModelError::TrackNotFound(*track))?;
-            let slot = stored
-                .effect_mut(*effect)
-                .ok_or(ModelError::EffectNotFound(*effect))?;
-            slot.bypassed = *bypassed;
-            outcome.track = Some(*track);
+            match track {
+                Some(track_id) => {
+                    let stored = project
+                        .track_mut(*track_id)
+                        .ok_or(ModelError::TrackNotFound(*track_id))?;
+                    let slot = stored
+                        .effect_mut(*effect)
+                        .ok_or(ModelError::EffectNotFound(*effect))?;
+                    slot.bypassed = *bypassed;
+                    outcome.track = Some(*track_id);
+                }
+                None => {
+                    let slot = project
+                        .master
+                        .effect_mut(*effect)
+                        .ok_or(ModelError::EffectNotFound(*effect))?;
+                    slot.bypassed = *bypassed;
+                }
+            }
             outcome.effect = Some(*effect);
         }
     }
@@ -1466,5 +1523,62 @@ mod tests {
         // Redo restores both notes
         store.redo();
         assert_eq!(store.project().pattern(pattern).unwrap().notes.len(), 2);
+    }
+
+    #[test]
+    fn master_params_and_effects_work_and_support_undo() {
+        let (mut store, ..) = fixture();
+        assert_eq!(store.project().master.gain, 1.0);
+        assert_eq!(store.project().master.pan, 0.0);
+        assert!(!store.project().master.mute);
+
+        store
+            .apply(EditCommand::SetMasterParams {
+                gain: Some(0.8),
+                pan: Some(-0.2),
+                mute: Some(true),
+            })
+            .unwrap();
+        assert_eq!(store.project().master.gain, 0.8);
+        assert_eq!(store.project().master.pan, -0.2);
+        assert!(store.project().master.mute);
+
+        // Add effect to master
+        let outcome = store
+            .apply(EditCommand::AddEffect {
+                track: None,
+                kind: EffectKind::Limiter,
+            })
+            .unwrap();
+        let effect_id = outcome.effect.expect("allocated effect id");
+        assert_eq!(store.project().master.effects.len(), 1);
+        assert!(!store.project().master.effects[0].bypassed);
+
+        // Bypass effect on master
+        store
+            .apply(EditCommand::SetEffectBypassed {
+                track: None,
+                effect: effect_id,
+                bypassed: true,
+            })
+            .unwrap();
+        assert!(store.project().master.effects[0].bypassed);
+
+        // Undo bypass
+        store.undo();
+        assert!(!store.project().master.effects[0].bypassed);
+
+        // Remove effect
+        store
+            .apply(EditCommand::RemoveEffect {
+                track: None,
+                effect: effect_id,
+            })
+            .unwrap();
+        assert!(store.project().master.effects.is_empty());
+
+        // Undo removal restores effect
+        store.undo();
+        assert_eq!(store.project().master.effects.len(), 1);
     }
 }
