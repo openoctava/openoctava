@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::model::{Clip, ClipId, Note, NoteId, Pattern, Preset, Project, Track, TrackId};
+use crate::model::{
+    Clip, ClipId, Note, NoteId, Pattern, Preset, Project, SoundParams, Track, TrackId,
+};
 use crate::sample::{SampleCache, SampleData};
 use crate::time::{TempoMap, Ticks};
 
@@ -38,11 +40,12 @@ pub struct SnapshotTrack {
     pub id: TrackId,
     pub channel: u8,
     pub preset: Preset,
+    pub sound_params: SoundParams,
     pub gain: f32,
     pub pan: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TimedEvent {
     pub tick: Ticks,
     pub track: TrackId,
@@ -50,6 +53,7 @@ pub struct TimedEvent {
     /// Preset of the pattern this note belongs to, so the synthesizer can
     /// switch sounds per pattern instead of per track.
     pub preset: Preset,
+    pub sound_params: SoundParams,
     pub clip: ClipId,
     pub note: NoteId,
     pub kind: EventKind,
@@ -103,6 +107,7 @@ impl Project {
                 id: track.id,
                 channel: track.channel,
                 preset: track.preset,
+                sound_params: SoundParams::default(),
                 gain: track.gain,
                 pan: track.pan,
             });
@@ -193,6 +198,7 @@ fn push_note_events(
         track: track.id,
         channel: track.channel,
         preset: pattern.preset,
+        sound_params: pattern.sound_params,
         clip: clip.id,
         note: note.id,
         kind: EventKind::NoteOn {
@@ -205,6 +211,7 @@ fn push_note_events(
         track: track.id,
         channel: track.channel,
         preset: pattern.preset,
+        sound_params: pattern.sound_params,
         clip: clip.id,
         note: note.id,
         kind: EventKind::NoteOff { key: note.key },

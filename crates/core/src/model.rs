@@ -145,6 +145,65 @@ impl Note {
     }
 }
 
+/// Sound-shaping synthesizer parameters (relative CC modifiers).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SoundParams {
+    /// Attack time relative scaling (0.0..=1.0, default 0.5 = neutral MIDI CC 64).
+    pub attack: f32,
+    /// Release time / note duration tail scaling (0.0..=1.0, default 0.5 = neutral MIDI CC 64).
+    pub release: f32,
+    /// Low-pass filter cutoff / brightness (0.0..=1.0, default 0.5 = neutral MIDI CC 64).
+    pub cutoff: f32,
+    /// Filter resonance (0.0..=1.0, default 0.0 = minimal).
+    pub resonance: f32,
+    /// Reverb send depth (0.0..=1.0, default 0.2).
+    pub reverb: f32,
+    /// Chorus send depth (0.0..=1.0, default 0.0).
+    pub chorus: f32,
+}
+
+impl Default for SoundParams {
+    fn default() -> Self {
+        Self {
+            attack: 0.5,
+            release: 0.5,
+            cutoff: 0.5,
+            resonance: 0.0,
+            reverb: 0.2,
+            chorus: 0.0,
+        }
+    }
+}
+
+impl SoundParams {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        let valid = |v: f32| v.is_finite() && (0.0..=1.0).contains(&v);
+        if !valid(self.attack) {
+            return Err(ModelError::InvalidSoundParam("attack must be in 0.0..=1.0"));
+        }
+        if !valid(self.release) {
+            return Err(ModelError::InvalidSoundParam(
+                "release must be in 0.0..=1.0",
+            ));
+        }
+        if !valid(self.cutoff) {
+            return Err(ModelError::InvalidSoundParam("cutoff must be in 0.0..=1.0"));
+        }
+        if !valid(self.resonance) {
+            return Err(ModelError::InvalidSoundParam(
+                "resonance must be in 0.0..=1.0",
+            ));
+        }
+        if !valid(self.reverb) {
+            return Err(ModelError::InvalidSoundParam("reverb must be in 0.0..=1.0"));
+        }
+        if !valid(self.chorus) {
+            return Err(ModelError::InvalidSoundParam("chorus must be in 0.0..=1.0"));
+        }
+        Ok(())
+    }
+}
+
 /// A reusable musical pattern, the unit the musician writes in the clips
 /// panel. Timeline clips are placements of a pattern, so editing the pattern
 /// changes every clip that plays it.
@@ -156,6 +215,8 @@ pub struct Pattern {
     /// synthesizer yet: a track owns a single MIDI channel and therefore a
     /// single program.
     pub preset: Preset,
+    #[serde(default)]
+    pub sound_params: SoundParams,
     pub length: Ticks,
     pub notes: Vec<Note>,
 }
@@ -441,6 +502,7 @@ impl Project {
             id,
             name: name.into(),
             preset: Preset::default(),
+            sound_params: SoundParams::default(),
             length,
             notes: Vec::new(),
         });
@@ -460,6 +522,7 @@ impl Project {
             id: copy,
             name: format!("{} copy", source.name),
             preset: source.preset,
+            sound_params: source.sound_params,
             length: source.length,
             notes: source.notes,
         });
@@ -856,6 +919,8 @@ pub enum ModelError {
     InvalidSampleGain,
     #[error("invalid preset: {0}")]
     InvalidPreset(Preset),
+    #[error("sound parameter out of range: {0}")]
+    InvalidSoundParam(&'static str),
     #[error("time signature is invalid")]
     InvalidTimeSignature,
     #[error(transparent)]

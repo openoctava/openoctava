@@ -20,6 +20,7 @@ use egui::{
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 use octava_core::{EditCommand, Project, Ticks, TimeSignature};
 
+pub use soundfont_player::SoundCategory;
 pub use state::{
     AudioSettingsView, DocumentView, FilesView, PlaybackView, SampleEntry, SoundfontPreset,
     SoundfontView, UiAction,

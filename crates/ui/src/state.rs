@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use crate::soundfont_player::SoundCategory;
 use egui::Pos2;
 use octava_core::{
-    ClipId, EditCommand, NoteId, PatternId, Preset, Project, SampleId, Ticks, TrackId,
+    ClipId, EditCommand, NoteId, PatternId, Preset, Project, SampleId, SoundParams, Ticks, TrackId,
 };
 
 /// Read-only transport state supplied by the application layer.
@@ -120,8 +121,9 @@ pub enum UiAction {
     /// Audition a sample through the audio engine while stopped.
     AuditionSample(PathBuf),
     AuditionNote {
-        track: TrackId,
+        track: Option<TrackId>,
         preset: Preset,
+        sound_params: SoundParams,
         key: u8,
         velocity: u8,
     },
@@ -495,6 +497,12 @@ pub(crate) struct UiState {
     pub audio_settings_open: bool,
     /// Pattern whose SoundFont player window is open.
     pub soundfont_player: Option<PatternId>,
+    /// Pattern whose instrument browser modal is open.
+    pub soundfont_browser: Option<PatternId>,
+    /// Filter query in the instrument browser.
+    pub soundfont_search: String,
+    /// Category filter in the instrument browser.
+    pub soundfont_category: SoundCategory,
     pub rename: Option<RenameState>,
 }
 
@@ -625,6 +633,13 @@ impl UiState {
             .is_some_and(|pattern| project.pattern(pattern).is_some());
         if !soundfont_player_is_valid {
             self.soundfont_player = None;
+        }
+
+        let soundfont_browser_is_valid = self
+            .soundfont_browser
+            .is_some_and(|pattern| project.pattern(pattern).is_some());
+        if !soundfont_browser_is_valid {
+            self.soundfont_browser = None;
         }
     }
 

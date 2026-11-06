@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use fluidlite::{FontId, Synth};
-use octava_core::{EventKind, PlaybackSnapshot, Preset, SampleData, Ticks, TimedEvent};
+use octava_core::{
+    EventKind, PlaybackSnapshot, Preset, SampleData, SoundParams, Ticks, TimedEvent,
+};
 use rtrb::{Consumer, Producer};
 
 use crate::engine::{AudioCommand, AudioTelemetry, PreviewNote, TransportState};
@@ -488,6 +490,7 @@ impl Runtime {
             let pan = ((track.pan.clamp(-1.0, 1.0) + 1.0) * 63.5).round() as u32;
             let _ = self.synth.cc(channel, 7, volume);
             let _ = self.synth.cc(channel, 10, pan.min(127));
+            Self::apply_sound_params(&mut self.synth, channel, track.sound_params);
         }
     }
 
@@ -556,6 +559,19 @@ impl Runtime {
         self.preview_sample = Some(SampleVoice::new(data, Ticks::ZERO, 1.0, 0.0));
     }
 
+    fn apply_sound_params(synth: &mut Synth, channel: u32, params: SoundParams) {
+        let send_cc = |num: u32, val: f32| {
+            let val_u32 = (val.clamp(0.0, 1.0) * 127.0).round() as u32;
+            let _ = synth.cc(channel, num, val_u32.min(127));
+        };
+        send_cc(73, params.attack);
+        send_cc(72, params.release);
+        send_cc(74, params.cutoff);
+        send_cc(71, params.resonance);
+        send_cc(91, params.reverb);
+        send_cc(93, params.chorus);
+    }
+
     fn preview_note(&mut self, note: PreviewNote) {
         if self.state == TransportState::Playing {
             return;
@@ -576,6 +592,7 @@ impl Runtime {
         let pan = ((note.pan.clamp(-1.0, 1.0) + 1.0) * 63.5).round() as u32;
         let _ = self.synth.cc(channel, 7, volume);
         let _ = self.synth.cc(channel, 10, pan.min(127));
+        Self::apply_sound_params(&mut self.synth, channel, note.sound_params);
         let _ = self
             .synth
             .note_on(channel, u32::from(note.key), u32::from(note.velocity));
@@ -615,6 +632,7 @@ impl Runtime {
                         u32::from(event.preset.program),
                     );
                     self.channel_preset[channel_index] = Some(event.preset);
+                    Self::apply_sound_params(&mut self.synth, channel, event.sound_params);
                 }
                 let _ = self
                     .synth
@@ -807,6 +825,7 @@ mod tests {
             .push(AudioCommand::PreviewNote(PreviewNote {
                 channel: 0,
                 preset: octava_core::Preset::default(),
+                sound_params: octava_core::SoundParams::default(),
                 gain: 1.0,
                 pan: 0.0,
                 key: 60,

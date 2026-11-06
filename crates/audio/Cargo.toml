@@ -16,3 +16,4 @@ cpal.workspace = true
 fluidlite.workspace = true
 rtrb.workspace = true
 thiserror.workspace = true
+clack-host = "0.2.0"

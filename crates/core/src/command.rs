@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     ClipId, EffectId, EffectKind, ModelError, NoteId, PatternId, Preset, Project, SampleId,
-    TrackId, validate_key, validate_note_geometry, validate_preset, validate_velocity,
+    SoundParams, TrackId, validate_key, validate_note_geometry, validate_preset, validate_velocity,
 };
 use crate::time::{Ticks, TimeSignature};
 
@@ -58,6 +58,10 @@ pub enum EditCommand {
     SetPatternPreset {
         pattern: PatternId,
         preset: Preset,
+    },
+    SetPatternSoundParams {
+        pattern: PatternId,
+        params: SoundParams,
     },
     SetPatternName {
         pattern: PatternId,
@@ -290,6 +294,14 @@ pub(crate) fn apply(
                 .pattern_mut(*pattern)
                 .ok_or(ModelError::PatternNotFound(*pattern))?;
             stored.preset = *preset;
+            outcome.pattern = Some(*pattern);
+        }
+        EditCommand::SetPatternSoundParams { pattern, params } => {
+            params.validate()?;
+            let stored = project
+                .pattern_mut(*pattern)
+                .ok_or(ModelError::PatternNotFound(*pattern))?;
+            stored.sound_params = *params;
             outcome.pattern = Some(*pattern);
         }
         EditCommand::SetPatternName { pattern, name } => {
@@ -1523,6 +1535,62 @@ mod tests {
         // Redo restores both notes
         store.redo();
         assert_eq!(store.project().pattern(pattern).unwrap().notes.len(), 2);
+    }
+
+    #[test]
+    fn pattern_sound_params_work_and_support_undo() {
+        let mut store = crate::store::ProjectStore::new(Project::default());
+        let pattern = store
+            .apply(EditCommand::AddPattern {
+                name: "Lead".into(),
+                length: Ticks(3840),
+            })
+            .unwrap()
+            .pattern
+            .unwrap();
+
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().sound_params,
+            SoundParams::default()
+        );
+
+        let custom = SoundParams {
+            attack: 0.1,
+            release: 0.9,
+            cutoff: 0.8,
+            resonance: 0.5,
+            reverb: 0.7,
+            chorus: 0.3,
+        };
+        store
+            .apply(EditCommand::SetPatternSoundParams {
+                pattern,
+                params: custom,
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().sound_params,
+            custom
+        );
+
+        assert!(store.undo());
+        assert_eq!(
+            store.project().pattern(pattern).unwrap().sound_params,
+            SoundParams::default()
+        );
+
+        let invalid = SoundParams {
+            attack: 1.5,
+            ..custom
+        };
+        assert!(
+            store
+                .apply(EditCommand::SetPatternSoundParams {
+                    pattern,
+                    params: invalid,
+                })
+                .is_err()
+        );
     }
 
     #[test]

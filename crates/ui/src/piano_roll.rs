@@ -284,8 +284,9 @@ fn handle_input(
         && let Some(track) = audition_track
     {
         actions.push(UiAction::AuditionNote {
-            track,
+            track: Some(track),
             preset: pattern.preset,
+            sound_params: pattern.sound_params,
             key: key_at_y(grid, pointer.y),
             velocity: 100,
         });
@@ -621,8 +622,9 @@ fn update_note_drag(
         && let Some(track) = audition_track
     {
         actions.push(UiAction::AuditionNote {
-            track,
+            track: Some(track),
             preset: pattern.preset,
+            sound_params: pattern.sound_params,
             key: next.preview_key,
             velocity: 100,
         });

@@ -36,7 +36,7 @@ rfd = { version = "0.14", default-features = false, features = [
 tokio = { version = "1", features = ["rt"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 dbg_macro = "warn"

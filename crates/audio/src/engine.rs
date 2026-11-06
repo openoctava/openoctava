@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fluidlite::{FontId, IsSettings as _, Settings, Synth};
-use octava_core::{PlaybackSnapshot, Preset, SampleData, Ticks};
+use octava_core::{PlaybackSnapshot, Preset, SampleData, SoundParams, Ticks};
 use rtrb::{Consumer, Producer, RingBuffer};
 use thiserror::Error;
 
@@ -123,6 +123,7 @@ impl AudioTelemetry {
 pub struct PreviewNote {
     pub channel: u8,
     pub preset: Preset,
+    pub sound_params: SoundParams,
     pub gain: f32,
     pub pan: f32,
     pub key: u8,

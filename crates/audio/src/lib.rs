@@ -7,11 +7,13 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod clap_host;
 mod engine;
 mod offline;
 mod runtime;
 mod soundfont;
 
+pub use clap_host::{DiscoveredPlugin, scan_clap_plugins, standard_clap_paths};
 pub use engine::{
     AudioEngine, AudioError, AudioSettingsConfig, AudioTelemetry, PreviewNote, TransportState,
     list_output_devices,

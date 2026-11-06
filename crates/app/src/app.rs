@@ -254,20 +254,22 @@ impl OctavaApp {
             UiAction::AuditionNote {
                 track,
                 preset,
+                sound_params,
                 key,
                 velocity,
             } => {
                 if self.playback.playing {
                     return;
                 }
-                let Some(track) = self.store.project().track(track) else {
-                    return;
-                };
+                let (channel, gain, pan) = track
+                    .and_then(|t| self.store.project().track(t))
+                    .map_or((0, 1.0, 0.0), |t| (t.channel, t.gain, t.pan));
                 let preview = PreviewNote {
-                    channel: track.channel,
+                    channel,
                     preset,
-                    gain: track.gain,
-                    pan: track.pan,
+                    sound_params,
+                    gain,
+                    pan,
                     key,
                     velocity,
                 };
@@ -345,6 +347,7 @@ impl OctavaApp {
                     bank: 0,
                     program: 0,
                 },
+                sound_params: octava_core::SoundParams::default(),
                 gain: 0.8,
                 pan: 0.0,
                 key: 69,
